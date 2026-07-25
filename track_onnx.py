@@ -1,146 +1,129 @@
-import sys
-import io
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
 import cv2
 import numpy as np
-import json
-import os
-import argparse
+import onnxruntime as ort
+import sys
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--points', type=str, default="0,0,100,0,100,100,0,100")
-parser.add_argument('--ui_w', type=float, default=1.0)
-parser.add_argument('--ui_h', type=float, default=1.0)
-parser.add_argument('--vid_w', type=float, default=1.0)
-parser.add_argument('--vid_h', type=float, default=1.0)
-args = parser.parse_args()
+# --- INPUT CONFIGURATION ---
+VIDEO_FILE = "your_local_video_file.mp4" # Path to your local video asset
 
-scale_x = args.vid_w / args.ui_w
-scale_y = args.vid_h / args.ui_h
+# Match the ordering: Top-Left, Top-Right, Bottom-Right, Bottom-Left
+MANUAL_PIXEL_CORNERS = np.array([
+    [320, 180],  
+    [960, 180], 
+    [1150, 680], 
+    [130, 680]
+], dtype=np.float32)
 
-p = [float(x) for x in args.points.split(',')]
+# Shared Core Functions
+def preprocess_frame(frame, target_dim=(640, 640)):
+    img = cv2.resize(frame, target_dim)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    img = np.expand_dims(img, axis=0)
+    return img
 
-pts_src = np.array([
-    [p[0] * scale_x, p[1] * scale_y],
-    [p[2] * scale_x, p[3] * scale_y],
-    [p[4] * scale_x, p[5] * scale_y],
-    [p[6] * scale_x, p[7] * scale_y]
-], dtype=float)
-
-pts_dst = np.array([
-    [0, 0], [105, 0], [105, 68], [0, 68]
-], dtype=float)
-
-H, _ = cv2.findHomography(pts_src, pts_dst)
-
-def convert_to_pitch_coords(pixel_x, pixel_y, homography_matrix):
-    point = np.array([[[pixel_x, pixel_y]]], dtype='float32')
-    transformed = cv2.perspectiveTransform(point, homography_matrix)
-    return round(float(transformed[0][0][0]), 2), round(float(transformed[0][0][1]), 2)
-
-onnx_path = "yolov8n.onnx"
-net = cv2.dnn.readNet(onnx_path)
-
-# SPEED OPTIMIZATION: Use CUDA GPU Acceleration if available
-if cv2.cuda.getCudaEnabledDeviceCount() > 0:
-    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-
-video_path = "match_sample.mp4"
-cap = cv2.VideoCapture(video_path)
-tracking_timeline = {}
-frame_count = 0
-
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
-        break
-    frame_count += 1
+def run_onnx_inference(session, frame, orig_shape, conf_threshold=0.35):
+    h_orig, w_orig = orig_shape[:2]
+    blob = preprocess_frame(frame)
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: blob})
+    predictions = np.squeeze(outputs[0])
     
-    img_h, img_w, _ = frame.shape
-    
-    input_width, input_height = 640, 640
-    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (input_width, input_height), swapRB=True, crop=False)
-    net.setInput(blob)
-    outputs = net.forward()
-    
-    predictions = np.squeeze(outputs[0]).T  
-    
-    x_factor = img_w / input_width
-    y_factor = img_h / input_height
-    
-    # SPEED OPTIMIZATION: Vectorized NumPy filtering instead of explicit loops
-    class_scores = predictions[:, 4:]
-    class_ids = np.argmax(class_scores, axis=1)
-    scores = np.max(class_scores, axis=1)
-    
-    # Create masks for target classes with specific confidence thresholds
-    person_mask = (class_ids == 0) & (scores > 0.30)
-    ball_mask = (class_ids == 32) & (scores > 0.10)
-    combined_mask = person_mask | ball_mask
-    
-    filtered_preds = predictions[combined_mask]
-    filtered_scores = scores[combined_mask]
-    filtered_class_ids = class_ids[combined_mask]
-    
+    if predictions.shape[0] < predictions.shape[1]:
+        predictions = predictions.T
+        
     boxes = []
-    for pred in filtered_preds:
-        cx, cy, w, h = pred[0], pred[1], pred[2], pred[3]
-        left = int((cx - 0.5 * w) * x_factor)
-        top = int((cy - 0.5 * h) * y_factor)
-        width = int(w * x_factor)
-        height = int(h * y_factor)
-        boxes.append([left, top, width, height])
+    confidences = []
+    
+    for pred in predictions:
+        class_scores = pred[4:]
+        class_id = np.argmax(class_scores)
+        
+        if class_id == 0 and class_scores[class_id] > conf_threshold:
+            conf = class_scores[class_id]
+            cx, cy, w, h = pred[0], pred[1], pred[2], pred[3]
             
-    indices = cv2.dnn.NMSBoxes(boxes, filtered_scores.tolist(), 0.10, 0.45)
-    
-    frame_players = {}
-    frame_ball = None
-    player_id = 0
-    
+            x1 = int((cx - w / 2) * (w_orig / 640.0))
+            y1 = int((cy - h / 2) * (h_orig / 640.0))
+            box_w = int(w * (w_orig / 640.0))
+            box_h = int(h * (h_orig / 640.0))
+            
+            boxes.append([x1, y1, box_w, box_h])
+            confidences.append(float(conf))
+            
+    indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, 0.45)
+    final_boxes = []
     if len(indices) > 0:
-        flat_indices = indices.flatten()
-        for index in flat_indices:
-            bx, by, bw, bh = boxes[index]
-            c_id = filtered_class_ids[index]
+        for i in indices.flatten():
+            final_boxes.append(boxes[i])
             
-            feet_x = bx + (bw / 2)
-            feet_y = by + bh
-            
-            pitch_x, pitch_z = convert_to_pitch_coords(feet_x, feet_y, H)
-            
-            if -10 <= pitch_x <= 115 and -10 <= pitch_z <= 78:
-                if c_id == 0:
-                    player_id += 1
-                    team = "A" if player_id % 2 == 0 else "B"
-                    # THE FIX: Provided BOTH 'y' and 'z' keys to completely safeguard frontend variations
-                    frame_players[str(player_id)] = {
-                        "x": pitch_x, 
-                        "y": pitch_z, 
-                        "z": pitch_z, 
-                        "team": team
-                    }
-                elif c_id == 32:
-                    frame_ball = {"x": pitch_x, "y": pitch_z, "z": pitch_z}
-                    
-    tracking_timeline[str(frame_count)] = {
-        "players": frame_players,
-        "ball": frame_ball
-    }
+    return final_boxes
+
+def compute_jersey_team(frame, box):
+    x, y, w, h = box
+    h_orig, w_orig = frame.shape[:2]
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(w_orig, x + w), min(h_orig, y + int(h * 0.35))
     
-    # Process up to 150 frames for test sequence validation
-    if frame_count >= 150:
-        break
+    if (x2 - x1) <= 0 or (y2 - y1) <= 0:
+        return "Light"
+        
+    roi = frame[y1:y2, x1:x2]
+    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    return "Light" if np.mean(gray_roi) > 120 else "Dark"
 
-cap.release()
+def main():
+    print("⚙️ Booting Standalone Test Bench using yolov8n.onnx...")
+    
+    try:
+        session = ort.InferenceSession("yolov8n.onnx", providers=['CPUExecutionProvider'])
+    except Exception as e:
+        print(f"❌ Error loading yolov8n.onnx: {e}")
+        sys.exit(1)
+        
+    dst_field_dims = np.array([[0, 0], [105, 0], [105, 68], [0, 68]], dtype=np.float32)
+    H_matrix, _ = cv2.findHomography(MANUAL_PIXEL_CORNERS, dst_field_dims)
+    
+    cap = cv2.VideoCapture(VIDEO_FILE)
+    if not cap.isOpened():
+        print(f"❌ Error: Could not parse video file at {VIDEO_FILE}")
+        sys.exit(1)
+        
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        detected_players = run_onnx_inference(session, frame, frame.shape)
+        
+        for box in detected_players:
+            x, y, w, h = box
+            feet_x = x + (w // 2)
+            feet_y = y + h
+            
+            px_vector = np.array([[[feet_x, feet_y]]], dtype=np.float32)
+            transformed_vector = cv2.perspectiveTransform(px_vector, H_matrix)
+            
+            real_x = float(transformed_vector[0][0][0])
+            real_z = float(transformed_vector[0][0][1])
+            
+            team_color = compute_jersey_team(frame, box)
+            draw_color = (255, 255, 255) if team_color == "Light" else (0, 0, 0)
+            
+            # Draw visual test framework layout on display window
+            cv2.rectangle(frame, (x, y), (x + w, y + h), draw_color, 2)
+            cv2.circle(frame, (feet_x, feet_y), 4, (0, 0, 255), -1)
+            cv2.putText(frame, f"{real_x:.1f}m, {real_z:.1f}m", (x, max(15, y - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
+                
+        cv2.polylines(frame, [MANUAL_PIXEL_CORNERS.astype(np.int32)], True, (0, 165, 255), 2)
+        cv2.imshow("Tactical Radar Local Test", frame)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+            
+    cap.release()
+    cv2.destroyAllWindows()
 
-# Ensure public output folder configuration exists
-os.makedirs("public", exist_ok=True)
-output_path = os.path.join("public", "tracking_data.json")
-with open(output_path, 'w') as f:
-    json.dump(tracking_timeline, f, indent=2)
-
-print(f"SUCCESS: Tracking asset successfully exported to -> {output_path}")
+if __name__ == "__main__":
+    main()

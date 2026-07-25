@@ -3,6 +3,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
+import * as ort from 'onnxruntime-web';
 
 // --- INTERFACES ---
 interface Point { x: number; y: number; label?: string; }
@@ -38,7 +39,6 @@ function undistortCoordinate(x: number, y: number, width: number, height: number
 
 function extractFourCornersFromPolygon(pts: Point[]) {
   if (pts.length < 4) return null;
-  // Find extreme bounding corners from the user's custom polygon
   let minX = pts[0], maxX = pts[0], minY = pts[0], maxY = pts[0];
   pts.forEach(p => {
     if (p.x < minX.x) minX = p;
@@ -46,7 +46,6 @@ function extractFourCornersFromPolygon(pts: Point[]) {
     if (p.y < minY.y) minY = p;
     if (p.y > maxY.y) maxY = p;
   });
-  // Return top-left, top-right, bottom-right, bottom-left approximations
   const sortedByY = [...pts].sort((a, b) => a.y - b.y);
   const topTwo = sortedByY.slice(0, 2).sort((a, b) => a.x - b.x);
   const botTwo = sortedByY.slice(sortedByY.length - 2).sort((a, b) => a.x - b.x);
@@ -126,6 +125,26 @@ function isInsidePolygon(pt: { x: number; y: number }, polygon: Point[]) {
   return inside;
 }
 
+// Helper: Convert RGB to HSV for Grass Removal
+function rgbToHsv(r: number, g: number, b: number) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  const s = max === 0 ? 0 : d / max;
+  const v = max;
+
+  if (max !== min) {
+    switch (max) {
+      case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+      case g: h = (b - r) / d + 2; break;
+      case b: h = (r - g) / d + 4; break;
+    }
+    h /= 6;
+  }
+  return [h * 360, s, v];
+}
+
 // --- 3D RENDER COMPONENTS ---
 function RealisticPitchMarkings() {
   const stripes = Array.from({ length: 15 }).map((_, i) => (
@@ -165,7 +184,7 @@ function RealisticPitchMarkings() {
   );
 }
 
-function LiveSoccerPitch3D({ liveFrameData }: any) {
+function LiveSoccerPitch3D({ liveFrameData }: { liveFrameData: FrameData }) {
   const players = liveFrameData?.players || {};
 
   return (
@@ -188,7 +207,7 @@ function LiveSoccerPitch3D({ liveFrameData }: any) {
         <mesh position={[0, 2.44, 0]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.06, 0.06, 7.32]} /><meshBasicMaterial color="#ffffff" /></mesh>
       </group>
 
-      {Object.entries(players).map(([id, player]: [string, any]) => (
+      {Object.entries(players).map(([id, player]) => (
         <group key={id} position={[player.x, 0.9, player.z]}>
           <mesh>
             <cylinderGeometry args={[0.4, 0.4, 1.8, 12]} />
@@ -207,9 +226,10 @@ function LiveSoccerPitch3D({ liveFrameData }: any) {
 // --- MAIN UI DASHBOARD ---
 export default function Home() {
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
+  const [videoName, setVideoName] = useState<string>('');
   const [videoAspect, setVideoAspect] = useState<number>(16 / 9);
   
-  // CALIBRATION STATES (Freeform Polygon Mapping)
+  // CALIBRATION STATES
   const [polygonPoints, setPolygonPoints] = useState<Point[]>([]);
   const [isLocked, setIsLocked] = useState<boolean>(false);
   const [showDebugBoxes, setShowDebugBoxes] = useState<boolean>(true);
@@ -218,10 +238,16 @@ export default function Home() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [liveFrameData, setLiveFrameData] = useState<FrameData>({ players: {}, ball: null, debugBoxes: [] });
   
+  // HYBRID ENGINE STATE
+  const [engineStatus, setEngineStatus] = useState<'IDLE' | 'YOLO_ONNX' | 'PIXEL_BACKUP'>('IDLE');
+  const [modelSession, setModelSession] = useState<ort.InferenceSession | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+
+  // V16 SLIDER STATES
   const [k1Distortion, setK1Distortion] = useState<number>(0.0);
   const [luminanceThreshold, setLuminanceThreshold] = useState<number>(110);
   const [clusteringRadius, setClusteringRadius] = useState<number>(2.5);
-  const [minPixelWeight, setMinPixelWeight] = useState<number>(2);
+  const [minPixelWeight, setMinPixelWeight] = useState<number>(50); // Increased default to fix artifacting
   const [motionSensitivity, setMotionSensitivity] = useState<number>(30);
   
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -233,21 +259,39 @@ export default function Home() {
   useEffect(() => {
     if (!canvasRef.current) canvasRef.current = document.createElement('canvas');
     if (!backgroundCanvasRef.current) backgroundCanvasRef.current = document.createElement('canvas');
+
+    // Init ONNX Client Model
+    async function initONNX() {
+      try {
+        ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
+        const session = await ort.InferenceSession.create('/yolov8n.onnx', { executionProviders: ['wasm'] });
+        setModelSession(session);
+        console.log("Matrix Locked: Local YOLOv8 ONNX model loaded successfully.");
+      } catch (err) {
+        console.warn("Failed to load local ONNX model. Ensure yolov8n.onnx is in /public.", err);
+      }
+    }
+    initONNX();
   }, []);
 
   const handleVideoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files?.[0]) {
-      setVideoSrc(URL.createObjectURL(e.target.files[0]));
+      const file = e.target.files[0];
+      setVideoSrc(URL.createObjectURL(file));
+      setVideoName(file.name);
       resetCalibration();
     }
   };
 
   const resetCalibration = () => {
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    if (socketRef.current) socketRef.current.close();
     setPolygonPoints([]);
     setIsLocked(false);
     setHomographyMatrix(null);
     setIsPlaying(false);
+    setEngineStatus('IDLE');
+    setLiveFrameData({ players: {}, ball: null, debugBoxes: [] });
   };
 
   const handleLoadedMetadata = () => {
@@ -268,9 +312,16 @@ export default function Home() {
     }
   };
 
-  // Robust Vision Loop with Strict Player-Size Filtering
+  // --- V17 ROBUST VISION LOOP (PIXEL FALLBACK w/ HSV GRASS FILTER) ---
   const runVisionLoop = useCallback(() => {
     if (!isPlaying || !videoRef.current || !homographyMatrix || polygonPoints.length < 3 || videoRef.current.paused) {
+      animFrameRef.current = requestAnimationFrame(runVisionLoop);
+      return;
+    }
+
+    // BYPASS HEAVY PIXEL MATH IF YOLO SERVER/CLIENT IS CONNECTED
+    if (engineStatus === 'YOLO_ONNX' && !modelSession) {
+      // If handling via websocket, we skip local logic. If local ONNX is ready, we'd run inference here.
       animFrameRef.current = requestAnimationFrame(runVisionLoop);
       return;
     }
@@ -318,11 +369,14 @@ export default function Home() {
           const r = currData[idx], g = currData[idx + 1], b = currData[idx + 2];
           const bgR = bgData[idx], bgG = bgData[idx + 1], bgB = bgData[idx + 2];
 
-          // 1. TURF / GRASS REJECTION: Ignore green pitch pixels completely
-          const isGrass = (g > r * 1.08 && g > b * 1.08 && g > 60);
-          if (isGrass) continue;
+          // 1. Convert to HSV to detect the field/grass perfectly regardless of shadows
+          const [h, s, v] = rgbToHsv(r, g, b);
 
-          // 2. MOTION DIFFERENCING: Must be moving relative to static background
+          // If the pixel falls in the green/yellow hue range AND has saturation (color)
+          // OR if the pixel is nearly pitch black (shadow artifact) - IGNORE IT
+          if ((h >= 50 && h <= 150 && s > 0.15) || v < 0.1) continue;
+
+          // 2. Perform baseline subtraction (Motion Check) on remaining non-grass pixels
           const diff = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
 
           if (diff > motionSensitivity) {
@@ -364,12 +418,12 @@ export default function Home() {
         }
       }
 
-      // STRICT PLAYER-SIZE FILTER: Discard giant shadow/lighting shift blobs (max width 50px, max height 80px)
       const filterPlayerBlobs = (clusters: ClusterInternal[]) => {
         return clusters.filter(c => {
           const w = c.maxX - c.minX;
           const h = c.maxY - c.minY;
-          return c.weight >= minPixelWeight && w <= 50 && h <= 80 && h >= 4;
+          // Heavily filter artifacts based on minPixelWeight and realistic player bounding box aspect ratio
+          return c.weight >= minPixelWeight && w <= 80 && h <= 120 && h >= 4;
         }).sort((a, b) => b.weight - a.weight).slice(0, 11);
       };
 
@@ -377,7 +431,7 @@ export default function Home() {
       const validLight = filterPlayerBlobs(rawClusters.Light);
 
       const players: Record<string, PlayerDetection> = {};
-      const debugBoxes: Array<{ minX: number; minY: number; maxX: number; maxY: number; team: string; weight: number }> = [];
+      const debugBoxes: FrameData['debugBoxes'] = [];
       let pCount = 1;
 
       [...validDark, ...validLight].forEach(c => {
@@ -395,7 +449,7 @@ export default function Home() {
     }
 
     animFrameRef.current = requestAnimationFrame(runVisionLoop);
-  }, [isPlaying, homographyMatrix, polygonPoints, k1Distortion, luminanceThreshold, clusteringRadius, minPixelWeight, motionSensitivity]);
+  }, [isPlaying, homographyMatrix, polygonPoints, k1Distortion, luminanceThreshold, clusteringRadius, minPixelWeight, motionSensitivity, engineStatus, modelSession]);
 
   useEffect(() => {
     if (isPlaying) {
@@ -417,6 +471,7 @@ export default function Home() {
     setPolygonPoints(prev => [...prev, { x, y }]);
   };
 
+  // --- HYBRID START: ATTEMPT YOLO, FALLBACK TO PIXEL ---
   const lockPolygonAndStart = () => {
     if (polygonPoints.length < 4 || !videoRef.current) return;
 
@@ -437,8 +492,45 @@ export default function Home() {
     setHomographyMatrix(solveHomography(undistortedSrcPoints, dstPoints));
     captureBackgroundFrame();
     setIsLocked(true);
-    setIsPlaying(true);
-    videoRef.current.play();
+    
+    // Attempt WebSocket Connection
+    const ws = new WebSocket("ws://127.0.0.1:8000/radar-stream");
+    socketRef.current = ws;
+
+    ws.onopen = () => {
+      console.log("🚀 YOLO Server Connected.");
+      setEngineStatus('YOLO_ONNX');
+      ws.send(JSON.stringify({
+        videoPath: videoName, 
+        corners: sortedCorners.map(pt => [pt.x, pt.y])
+      }));
+      setIsPlaying(true);
+      videoRef.current?.play();
+    };
+
+    ws.onmessage = (event) => {
+      const incomingData = JSON.parse(event.data);
+      if (incomingData.error) return;
+      setLiveFrameData({
+        players: incomingData.players,
+        ball: incomingData.ball,
+        debugBoxes: incomingData.debugBoxes
+      });
+    };
+
+    ws.onerror = () => {
+      console.warn("⚠️ YOLO Server unreachable. Engaging HTML5 Pixel Differential Engine.");
+      ws.close();
+      setEngineStatus('PIXEL_BACKUP');
+      setIsPlaying(true);
+      videoRef.current?.play();
+    };
+
+    ws.onclose = () => {
+      if (engineStatus !== 'PIXEL_BACKUP') {
+        console.log("🔌 Primary Connection Closed.");
+      }
+    };
   };
 
   const getScale = () => {
@@ -457,8 +549,11 @@ export default function Home() {
       
       <div className="w-full border-b border-neutral-800 px-6 py-3 bg-neutral-900 flex justify-between items-center z-50">
         <div className="flex items-center gap-3">
-          <div className={`w-2 h-2 ${isPlaying ? 'bg-emerald-500 animate-pulse' : 'bg-neutral-500'}`}></div>
-          <span className="text-xs font-bold tracking-widest text-white uppercase">TACTICAL RADAR V16.0 [FREEFORM POLYGON + STRICT PLAYER SIZING]</span>
+          <div className={`w-2 h-2 rounded-full ${
+            engineStatus === 'YOLO_ONNX' ? 'bg-emerald-500 animate-pulse' : 
+            engineStatus === 'PIXEL_BACKUP' ? 'bg-amber-500 animate-pulse' : 'bg-neutral-500'
+          }`}></div>
+          <span className="text-xs font-bold tracking-widest text-white uppercase">TACTICAL RADAR V19.0 [HYBRID ARCHITECTURE: POLYGON + YOLO]</span>
         </div>
         <div className="flex items-center gap-4">
           <span className="text-[11px] text-neutral-400 font-semibold uppercase tracking-wider">SOURCE FEED:</span>
@@ -474,7 +569,7 @@ export default function Home() {
             <div className="flex flex-col gap-4 w-full">
               
               <div className="bg-neutral-900 border border-neutral-800 p-4 rounded flex flex-col gap-5 shadow-inner">
-                <span className="text-xs font-black tracking-widest uppercase text-white border-b border-neutral-800 pb-2">Vision Engine Parameters</span>
+                <span className="text-xs font-black tracking-widest uppercase text-white border-b border-neutral-800 pb-2">Fallback Vision Parameters</span>
                 
                 <div className="flex flex-col gap-2">
                   <div className="flex justify-between items-center">
@@ -489,7 +584,7 @@ export default function Home() {
                     <span className="text-[10px] uppercase font-bold text-teal-400">Motion Sensitivity</span>
                     <span className="text-[10px] text-neutral-400">{motionSensitivity}</span>
                   </div>
-                  <input type="range" min="10" max="80" step="1" value={motionSensitivity} onChange={(e) => setMotionSensitivity(parseInt(e.target.value))} className="w-full cursor-pointer accent-teal-500"/>
+                  <input type="range" min="10" max="80" step="1" value={motionSensitivity} onChange={(e) => setMotionSensitivity(parseInt(e.target.value))} className="w-full cursor-pointer accent-teal-500" disabled={engineStatus === 'YOLO_ONNX'}/>
                 </div>
 
                 <div className="flex flex-col gap-2">
@@ -497,7 +592,7 @@ export default function Home() {
                     <span className="text-[10px] uppercase font-bold text-amber-400">Kit Luminance Split</span>
                     <span className="text-[10px] text-neutral-400">{luminanceThreshold}</span>
                   </div>
-                  <input type="range" min="30" max="200" step="1" value={luminanceThreshold} onChange={(e) => setLuminanceThreshold(parseInt(e.target.value))} className="w-full cursor-pointer accent-amber-500"/>
+                  <input type="range" min="30" max="200" step="1" value={luminanceThreshold} onChange={(e) => setLuminanceThreshold(parseInt(e.target.value))} className="w-full cursor-pointer accent-amber-500" disabled={engineStatus === 'YOLO_ONNX'}/>
                 </div>
 
                 <div className="flex flex-col gap-2">
@@ -505,7 +600,7 @@ export default function Home() {
                     <span className="text-[10px] uppercase font-bold text-fuchsia-400">Cluster Radius (Meters)</span>
                     <span className="text-[10px] text-neutral-400">{clusteringRadius.toFixed(1)}m</span>
                   </div>
-                  <input type="range" min="1.0" max="8.0" step="0.1" value={clusteringRadius} onChange={(e) => setClusteringRadius(parseFloat(e.target.value))} className="w-full cursor-pointer accent-fuchsia-500"/>
+                  <input type="range" min="1.0" max="8.0" step="0.1" value={clusteringRadius} onChange={(e) => setClusteringRadius(parseFloat(e.target.value))} className="w-full cursor-pointer accent-fuchsia-500" disabled={engineStatus === 'YOLO_ONNX'}/>
                 </div>
 
                 <div className="flex flex-col gap-2">
@@ -513,11 +608,11 @@ export default function Home() {
                     <span className="text-[10px] uppercase font-bold text-red-400">Min Pixel Mass</span>
                     <span className="text-[10px] text-neutral-400">{minPixelWeight} px</span>
                   </div>
-                  <input type="range" min="1" max="20" step="1" value={minPixelWeight} onChange={(e) => setMinPixelWeight(parseInt(e.target.value))} className="w-full cursor-pointer accent-red-500"/>
+                  <input type="range" min="1" max="150" step="1" value={minPixelWeight} onChange={(e) => setMinPixelWeight(parseInt(e.target.value))} className="w-full cursor-pointer accent-red-500" disabled={engineStatus === 'YOLO_ONNX'}/>
                 </div>
 
                 <div className="flex items-center justify-between border-t border-neutral-800 pt-3">
-                  <span className="text-[10px] uppercase font-bold text-emerald-400">Show Tracker Bounding Boxes (Debug)</span>
+                  <span className="text-[10px] uppercase font-bold text-emerald-400">Show Tracker Bounding Boxes</span>
                   <input type="checkbox" checked={showDebugBoxes} onChange={(e) => setShowDebugBoxes(e.target.checked)} className="accent-emerald-500 w-4 h-4 cursor-pointer"/>
                 </div>
               </div>
@@ -537,7 +632,6 @@ export default function Home() {
               <div ref={containerRef} onClick={handleVideoClick} style={{ aspectRatio: videoAspect }} className="relative border-2 border-neutral-800 bg-black cursor-crosshair w-full overflow-hidden shrink-0">
                 <video ref={videoRef} src={videoSrc} onLoadedMetadata={handleLoadedMetadata} className="w-full h-full object-fill opacity-90 pointer-events-none" muted playsInline />
                 
-                {/* Freeform Polygon Mask */}
                 {polygonPoints.length > 0 && (
                   <svg className="absolute top-0 left-0 w-full h-full pointer-events-none z-10">
                     <polygon 
@@ -549,14 +643,12 @@ export default function Home() {
                   </svg>
                 )}
 
-                {/* Polygon Node Markers */}
                 {polygonPoints.map((pt, idx) => (
                   <div key={`node-${idx}`} style={{ left: (pt.x * scaleX) - 6, top: (pt.y * scaleY) - 6 }} className="absolute w-3 h-3 border-2 border-amber-500 bg-black z-20 flex items-center justify-center rounded-sm">
                     <span className="text-[8px] text-amber-400 font-bold absolute -top-3">{idx + 1}</span>
                   </div>
                 ))}
 
-                {/* DEBUG BOUNDING BOXES OVERLAY */}
                 {showDebugBoxes && isPlaying && liveFrameData.debugBoxes.map((box, idx) => {
                   const width = (box.maxX - box.minX) * scaleX;
                   const height = (box.maxY - box.minY) * scaleY;
@@ -569,15 +661,15 @@ export default function Home() {
                       style={{ left, top, width: Math.max(width, 10), height: Math.max(height, 10), borderColor: color }}
                       className="absolute border border-dashed bg-white/10 z-30 pointer-events-none flex items-start p-0.5"
                     >
-                      <span className="text-[7px] text-white bg-black/80 px-0.5 font-bold">{box.weight}px</span>
+                      {box.weight && <span className="text-[7px] text-white bg-black/80 px-0.5 font-bold">{box.weight}px</span>}
                     </div>
                   );
                 })}
               </div>
 
               {!isLocked && polygonPoints.length >= 4 && (
-                <button onClick={lockPolygonAndStart} className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-black font-black text-[11px] tracking-[0.2em] uppercase rounded-sm transition">
-                  LOCK MESH & START TRACKING
+                <button onClick={lockPolygonAndStart} className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-black font-black text-[11px] tracking-[0.2em] uppercase rounded-sm transition shadow-lg">
+                  ENGAGE HYBRID INFERENCE SUITE
                 </button>
               )}
 
@@ -590,7 +682,7 @@ export default function Home() {
         {/* RIGHT PANEL: 3D ENGINE */}
         <div className="w-1/2 h-full relative bg-neutral-950 flex flex-col border-l border-neutral-900">
           <div className="absolute top-4 left-4 z-20 pointer-events-none">
-            {homographyMatrix && (
+            {isLocked && (
               <div className="bg-black/80 border border-neutral-800 p-3 text-[10px] text-neutral-400 tracking-wider uppercase backdrop-blur-sm rounded w-48 shadow-lg">
                 <span className="font-bold text-white block border-b border-neutral-800 pb-1 mb-2">Live Telemetry (Max 11)</span>
                 <div className="flex justify-between items-center mb-1">
@@ -608,14 +700,12 @@ export default function Home() {
           <div className="flex-grow w-full h-full cursor-move">
             <Canvas camera={{ position: [52.5, 55, 100], fov: 38 }}>
               <color attach="background" args={['#050505']} />
-              <LiveSoccerPitch3D 
-                liveFrameData={liveFrameData} 
-              />
+              <LiveSoccerPitch3D liveFrameData={liveFrameData} />
               <OrbitControls target={[52.5, 0, 34]} maxPolarAngle={Math.PI / 2.15} enableDamping dampingFactor={0.05} />
             </Canvas>
           </div>
 
-          {homographyMatrix && (
+          {isLocked && (
             <div className="bg-black border-t border-neutral-900 p-4 flex items-center justify-between z-30 shadow-[0_-10px_30px_rgba(0,0,0,0.5)]">
               <button onClick={() => { if(videoRef.current){ isPlaying ? videoRef.current.pause() : videoRef.current.play(); setIsPlaying(!isPlaying); } }} className="px-6 py-2 bg-neutral-900 text-white text-[11px] font-bold border border-neutral-700 uppercase tracking-widest rounded-sm hover:bg-neutral-800 transition">
                 {isPlaying ? 'PAUSE STREAM' : 'RESUME STREAM'}
@@ -624,6 +714,21 @@ export default function Home() {
           )}
         </div>
 
+      </div>
+
+      {/* DYNAMIC PIPELINE ENGINE STATUS LOWER FOOTER */}
+      <div className="w-full border-t border-neutral-800 px-6 py-2 bg-neutral-900 flex justify-between items-center text-[10px] tracking-wider text-neutral-400 z-50">
+        <div>CORE PIPELINE DISPATCH OVERLAY</div>
+        <div className="flex items-center gap-2">
+          <span>ACTIVE DETECTION CORE:</span>
+          <span className={`px-2 py-0.5 rounded font-bold text-black ${
+            engineStatus === 'YOLO_ONNX' ? 'bg-emerald-400' :
+            engineStatus === 'PIXEL_BACKUP' ? 'bg-amber-400' : 'bg-neutral-700 text-neutral-300'
+          }`}>
+            {engineStatus === 'YOLO_ONNX' ? "⚡ PRIMARY YOLO PIPELINE" : 
+             engineStatus === 'PIXEL_BACKUP' ? "⚠️ HTML5 PIXEL FALLBACK" : "IDLE"}
+          </span>
+        </div>
       </div>
     </main>
   );

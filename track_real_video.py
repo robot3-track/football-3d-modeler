@@ -1,133 +1,149 @@
 import cv2
 import numpy as np
+import onnxruntime as ort
 import json
-import os
+import asyncio
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
-print("Initializing Pure-CV Local Tracking Engine (No PyTorch)...")
+app = FastAPI()
 
-# 1. SETUP HOMOGRAPHY Matrix Mappings
-# These pixel markers must be adjusted if your UI resolution scale changes
-pts_src = np.array([
-    [350, 200], # 1. Top-Left click
-    [800, 220], # 2. Top-Right click
-    [950, 600], # 3. Bottom-Right click
-    [200, 550]  # 4. Bottom-Left click
-], dtype=float)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# FIXED: Mapped click points to the full 105m x 68m boundaries instead of a partial penalty box
-pts_dst = np.array([
-    [0, 0],      # 1. Top-Left Corner of Pitch
-    [105, 0],    # 2. Top-Right Corner of Pitch
-    [105, 68],   # 3. Bottom-Right Corner of Pitch
-    [0, 68]      # 4. Bottom-Left Corner of Pitch
-], dtype=float)
+# Shared Core Functions
+def preprocess_frame(frame, target_dim=(640, 640)):
+    img = cv2.resize(frame, target_dim)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))  # HWC to CHW
+    img = np.expand_dims(img, axis=0)
+    return img
 
-H, _ = cv2.findHomography(pts_src, pts_dst)
-
-def convert_to_pitch_coords(pixel_x, pixel_y, homography_matrix):
-    point = np.array([[[pixel_x, pixel_y]]], dtype='float32')
-    transformed = cv2.perspectiveTransform(point, homography_matrix)
-    return round(float(transformed[0][0][0]), 2), round(float(transformed[0][0][1]), 2)
-
-# 2. LOAD OPENCV DNN FIELD DETECTOR 
-net = cv2.dnn.readNet("yolov3.weights", "yolov3.cfg")
-layer_names = net.getLayerNames()
-output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
-
-# 3. OPEN REAL VIDEO FEED
-video_path = "match_sample.mp4"
-if not os.path.exists(video_path):
-    raise FileNotFoundError(f"Missing file: Place your video clip in this folder and name it '{video_path}'")
-
-cap = cv2.VideoCapture(video_path)
-tracking_timeline = {}
-frame_count = 0
-
-print("🎥 Processing video frames via DNN matrix...")
-
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
-        break
-    frame_count += 1
+def run_onnx_inference(session, frame, orig_shape, conf_threshold=0.35):
+    h_orig, w_orig = orig_shape[:2]
+    blob = preprocess_frame(frame)
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: blob})
+    predictions = np.squeeze(outputs[0])
     
-    height, width, channels = frame.shape
-    
-    # Preprocess image frame for the network
-    blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
-    net.setInput(blob)
-    outs = net.forward(output_layers)
-    
+    if predictions.shape[0] < predictions.shape[1]:
+        predictions = predictions.T
+        
     boxes = []
     confidences = []
     
-    # Parse raw detection footprints
-    for out in outs:
-        for detection in out:
-            scores = detection[5:]
-            class_id = np.argmax(scores)
-            confidence = scores[class_id]
-            
-            # Extract person class (0) with structural confidence threshold filter
-            if class_id == 0 and confidence > 0.4:
-                center_x = int(detection[0] * width)
-                center_y = int(detection[1] * height)
-                w = int(detection[2] * width)
-                h = int(detection[3] * height)
-                
-                # Transform to standard top-left bounding box anchors
-                x = int(center_x - w / 2)
-                y = int(center_y - h / 2)
-                
-                boxes.append([x, y, w, h])
-                confidences.append(float(confidence))
-    
-    # FIXED: Non-Maximum Suppression added to deduplicate hundreds of duplicate ghost overlapping boxes
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.4, 0.3)
-    
-    frame_players = {}
-    person_idx = 0
-    
-    if len(indices) > 0:
-        flat_indices = indices.flatten() if hasattr(indices, 'flatten') else indices
+    for pred in predictions:
+        class_scores = pred[4:]
+        class_id = np.argmax(class_scores)
         
-        for index in flat_indices:
-            bx, by, bw, bh = boxes[index]
+        # COCO Class 0 = Person
+        if class_id == 0 and class_scores[class_id] > conf_threshold:
+            conf = class_scores[class_id]
+            cx, cy, w, h = pred[0], pred[1], pred[2], pred[3]
             
-            # Ground anchor alignment logic: bottom-mid point of the bounding box
-            feet_x = bx + (bw / 2)
-            feet_y = by + bh
+            x1 = int((cx - w / 2) * (w_orig / 640.0))
+            y1 = int((cy - h / 2) * (h_orig / 640.0))
+            box_w = int(w * (w_orig / 640.0))
+            box_h = int(h * (h_orig / 640.0))
             
-            pitch_x, pitch_z = convert_to_pitch_coords(feet_x, feet_y, H)
+            boxes.append([x1, y1, box_w, box_h])
+            confidences.append(float(conf))
             
-            # Check bounding frame threshold limits
-            if -10 <= pitch_x <= 115 and -10 <= pitch_z <= 78:
-                person_idx += 1
-                team = "A" if person_idx % 2 == 0 else "B"
+    indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, 0.45)
+    final_boxes = []
+    if len(indices) > 0:
+        for i in indices.flatten():
+            final_boxes.append(boxes[i])
+            
+    return final_boxes
+
+def compute_jersey_team(frame, box):
+    x, y, w, h = box
+    h_orig, w_orig = frame.shape[:2]
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(w_orig, x + w), min(h_orig, y + int(h * 0.35))
+    
+    if (x2 - x1) <= 0 or (y2 - y1) <= 0:
+        return "Light"
+        
+    roi = frame[y1:y2, x1:x2]
+    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    return "Light" if np.mean(gray_roi) > 120 else "Dark"
+
+@app.websocket("/radar-stream")
+async def radar_stream_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    print("🔌 React Dashboard connected.")
+    
+    try:
+        raw_config = await websocket.receive_text()
+        config = json.loads(raw_config)
+        
+        video_source = config.get("videoPath")
+        ui_corners = np.array(config.get("corners"), dtype=np.float32)
+        
+        # Always use the root model asset
+        ort_session = ort.InferenceSession("yolov8n.onnx", providers=['CPUExecutionProvider'])
+        
+        dst_field_corners = np.array([[0, 0], [105, 0], [105, 68], [0, 68]], dtype=np.float32)
+        H_matrix, _ = cv2.findHomography(ui_corners, dst_field_corners)
+        
+        cap = cv2.VideoCapture(video_source)
+        if not cap.isOpened():
+            await websocket.send_text(json.dumps({"error": f"Unable to read video: {video_source}"}))
+            return
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
                 
-                # FIXED: Maps out both 'y' and 'z' coordinate properties to prevent 3D engine flattening bugs
-                frame_players[str(person_idx)] = {
-                    "x": pitch_x, 
-                    "y": pitch_z, 
-                    "z": pitch_z, 
-                    "team": team
+            detected_players = run_onnx_inference(ort_session, frame, frame.shape)
+            players_map = {}
+            debug_boxes_map = []
+            
+            for index, box in enumerate(detected_players):
+                x, y, w, h = box
+                feet_px_x = x + (w // 2)
+                feet_px_y = y + h
+                
+                pixel_vector = np.array([[[feet_px_x, feet_px_y]]], dtype=np.float32)
+                warped_vector = cv2.perspectiveTransform(pixel_vector, H_matrix)
+                
+                pitch_x = float(warped_vector[0][0][0])
+                pitch_z = float(warped_vector[0][0][1])
+                
+                pitch_x = max(0.5, min(104.5, pitch_x))
+                pitch_z = max(0.5, min(67.5, pitch_z))
+                
+                team_group = compute_jersey_team(frame, box)
+                player_key = f"ai_p_{index + 1}"
+                
+                players_map[player_key] = {
+                    "id": player_key, "x": round(pitch_x, 2), "z": round(pitch_z, 2), "team": team_group
                 }
                 
-    tracking_timeline[str(frame_count)] = {
-        "players": frame_players,
-        "ball": None
-    }
-    
-    if frame_count >= 200: 
-        break
+                debug_boxes_map.append({
+                    "minX": x, "minY": y, "maxX": x + w, "maxY": y + h, "team": team_group, "weight": 100
+                })
+                
+            await websocket.send_text(json.dumps({
+                "players": players_map, "ball": None, "debugBoxes": debug_boxes_map
+            }))
+            
+            await asyncio.sleep(0.033)
+            
+        cap.release()
+    except Exception as error_msg:
+        print(f"⚠️ Session encountered runtime drop: {error_msg}")
+    finally:
+        print("🔌 Stream disconnected.")
 
-cap.release()
-
-# 4. EXPORT JSON DATA MATRIX DIRECTLY INTO THE PUBLIC FOLDER
-output_path = os.path.join("public", "tracking_data.json")
-os.makedirs("public", exist_ok=True)
-
-with open(output_path, 'w') as f:
-    json.dump(tracking_timeline, f, indent=2)
-
-print(f"\nSUCCESS: Radar tracking telemetry assets exported to -> {output_path}")
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
