@@ -36,11 +36,20 @@ function undistortCoordinate(x: number, y: number, width: number, height: number
   };
 }
 
-function sortFourCorners(pts: Point[]) {
-  if (pts.length !== 4) return null;
+function extractFourCornersFromPolygon(pts: Point[]) {
+  if (pts.length < 4) return null;
+  // Find extreme bounding corners from the user's custom polygon
+  let minX = pts[0], maxX = pts[0], minY = pts[0], maxY = pts[0];
+  pts.forEach(p => {
+    if (p.x < minX.x) minX = p;
+    if (p.x > maxX.x) maxX = p;
+    if (p.y < minY.y) minY = p;
+    if (p.y > maxY.y) maxY = p;
+  });
+  // Return top-left, top-right, bottom-right, bottom-left approximations
   const sortedByY = [...pts].sort((a, b) => a.y - b.y);
   const topTwo = sortedByY.slice(0, 2).sort((a, b) => a.x - b.x);
-  const botTwo = sortedByY.slice(2, 4).sort((a, b) => a.x - b.x);
+  const botTwo = sortedByY.slice(sortedByY.length - 2).sort((a, b) => a.x - b.x);
   return [
     topTwo[0], // Top-Left
     topTwo[1], // Top-Right
@@ -101,10 +110,9 @@ function projectPoint(H: number[][], u: number, v: number) {
   if (Math.abs(W) < 1e-6) return { x: 52.5, z: 34 };
   const rawX = (H[0][0] * u + H[0][1] * v + H[0][2]) / W;
   const rawZ = (H[1][0] * u + H[1][1] * v + H[1][2]) / W;
-  // Strict clamping to prevent out-of-bounds projections stacking on edges
   return {
-    x: Math.max(2, Math.min(103, rawX)),
-    z: Math.max(2, Math.min(66, rawZ))
+    x: Math.max(1, Math.min(104, rawX)),
+    z: Math.max(1, Math.min(67, rawZ))
   };
 }
 
@@ -201,9 +209,9 @@ export default function Home() {
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
   const [videoAspect, setVideoAspect] = useState<number>(16 / 9);
   
-  // CALIBRATION STATES (Strictly 4 Pitch Corners)
-  const [calibrationStep, setCalibrationStep] = useState<'corners' | 'ready'>('corners');
-  const [pitchCorners, setPitchCorners] = useState<Point[]>([]);
+  // CALIBRATION STATES (Freeform Polygon Mapping)
+  const [polygonPoints, setPolygonPoints] = useState<Point[]>([]);
+  const [isLocked, setIsLocked] = useState<boolean>(false);
   const [showDebugBoxes, setShowDebugBoxes] = useState<boolean>(true);
   
   const [homographyMatrix, setHomographyMatrix] = useState<number[][] | null>(null);
@@ -212,9 +220,9 @@ export default function Home() {
   
   const [k1Distortion, setK1Distortion] = useState<number>(0.0);
   const [luminanceThreshold, setLuminanceThreshold] = useState<number>(110);
-  const [clusteringRadius, setClusteringRadius] = useState<number>(3.5);
-  const [minPixelWeight, setMinPixelWeight] = useState<number>(3);
-  const [motionSensitivity, setMotionSensitivity] = useState<number>(25);
+  const [clusteringRadius, setClusteringRadius] = useState<number>(2.5);
+  const [minPixelWeight, setMinPixelWeight] = useState<number>(2);
+  const [motionSensitivity, setMotionSensitivity] = useState<number>(30);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -236,8 +244,8 @@ export default function Home() {
 
   const resetCalibration = () => {
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-    setPitchCorners([]);
-    setCalibrationStep('corners');
+    setPolygonPoints([]);
+    setIsLocked(false);
     setHomographyMatrix(null);
     setIsPlaying(false);
   };
@@ -248,7 +256,6 @@ export default function Home() {
     }
   };
 
-  // Capture background frame reference on start for motion differencing
   const captureBackgroundFrame = () => {
     if (!videoRef.current || !backgroundCanvasRef.current) return;
     const bgCanvas = backgroundCanvasRef.current;
@@ -261,9 +268,9 @@ export default function Home() {
     }
   };
 
-  // Dedicated Robust Motion + Vision Loop via requestAnimationFrame
+  // Robust Vision Loop with Strict Player-Size Filtering
   const runVisionLoop = useCallback(() => {
-    if (!isPlaying || !videoRef.current || !homographyMatrix || pitchCorners.length !== 4 || videoRef.current.paused) {
+    if (!isPlaying || !videoRef.current || !homographyMatrix || polygonPoints.length < 3 || videoRef.current.paused) {
       animFrameRef.current = requestAnimationFrame(runVisionLoop);
       return;
     }
@@ -301,73 +308,73 @@ export default function Home() {
       }
 
       const rawClusters: { Dark: ClusterInternal[], Light: ClusterInternal[] } = { Dark: [], Light: [] };
-      const stepX = 6, stepY = 6; 
+      const stepX = 4, stepY = 4; 
 
       for (let y = 0; y < canvas.height; y += stepY) {
         for (let x = 0; x < canvas.width; x += stepX) {
-          if (!isInsidePolygon({ x, y }, pitchCorners)) continue;
+          if (!isInsidePolygon({ x, y }, polygonPoints)) continue;
 
           const idx = (y * canvas.width + x) * 4;
           const r = currData[idx], g = currData[idx + 1], b = currData[idx + 2];
           const bgR = bgData[idx], bgG = bgData[idx + 1], bgB = bgData[idx + 2];
 
-          // MOTION DIFFERENCING: Check if pixel differs from static background (ignores grass & buildings!)
+          // 1. TURF / GRASS REJECTION: Ignore green pitch pixels completely
+          const isGrass = (g > r * 1.08 && g > b * 1.08 && g > 60);
+          if (isGrass) continue;
+
+          // 2. MOTION DIFFERENCING: Must be moving relative to static background
           const diff = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
 
           if (diff > motionSensitivity) {
             const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-            const undistorted = undistortCoordinate(x, y, canvas.width, canvas.height, k1Distortion);
-            const projected = projectPoint(homographyMatrix, undistorted.x, undistorted.y);
-
-            const team = luminance >= luminanceThreshold ? 'Light' : 'Dark';
-            let merged = false;
-
-            for (let c of rawClusters[team]) {
-              const dist = Math.hypot(c.x - projected.x, c.z - projected.z);
-              if (dist < clusteringRadius) {
-                c.x = ((c.x * c.weight) + projected.x) / (c.weight + 1);
-                c.z = ((c.z * c.weight) + projected.z) / (c.weight + 1);
-                c.weight += 1;
-                c.minX = Math.min(c.minX, x);
-                c.maxX = Math.max(c.maxX, x);
-                c.minY = Math.min(c.minY, y);
-                c.maxY = Math.max(c.maxY, y);
-                merged = true;
-                break;
-              }
-            }
             
-            if (!merged) {
-              rawClusters[team].push({ 
-                x: projected.x, 
-                z: projected.z, 
-                team, 
-                weight: 1,
-                minX: x, maxX: x, minY: y, maxY: y 
-              });
+            if (luminance > 20 && luminance < 240) {
+              const undistorted = undistortCoordinate(x, y, canvas.width, canvas.height, k1Distortion);
+              const projected = projectPoint(homographyMatrix, undistorted.x, undistorted.y);
+
+              const team = luminance >= luminanceThreshold ? 'Light' : 'Dark';
+              let merged = false;
+
+              for (let c of rawClusters[team]) {
+                const dist = Math.hypot(c.x - projected.x, c.z - projected.z);
+                if (dist < clusteringRadius) {
+                  c.x = ((c.x * c.weight) + projected.x) / (c.weight + 1);
+                  c.z = ((c.z * c.weight) + projected.z) / (c.weight + 1);
+                  c.weight += 1;
+                  c.minX = Math.min(c.minX, x);
+                  c.maxX = Math.max(c.maxX, x);
+                  c.minY = Math.min(c.minY, y);
+                  c.maxY = Math.max(c.maxY, y);
+                  merged = true;
+                  break;
+                }
+              }
+              
+              if (!merged) {
+                rawClusters[team].push({ 
+                  x: projected.x, 
+                  z: projected.z, 
+                  team, 
+                  weight: 1,
+                  minX: x, maxX: x, minY: y, maxY: y 
+                });
+              }
             }
           }
         }
       }
 
-      const applyNMS = (clusters: ClusterInternal[]) => {
-        const sorted = [...clusters].filter(c => c.weight >= minPixelWeight).sort((a, b) => b.weight - a.weight);
-        const kept: ClusterInternal[] = [];
-        for (const c of sorted) {
-          let overlap = false;
-          for (const k of kept) {
-            if (Math.hypot(k.x - c.x, k.z - c.z) < (clusteringRadius * 1.5)) {
-              overlap = true;
-              break;
-            }
-          }
-          if (!overlap) kept.push(c);
-        }
-        return kept.slice(0, 11);
+      // STRICT PLAYER-SIZE FILTER: Discard giant shadow/lighting shift blobs (max width 50px, max height 80px)
+      const filterPlayerBlobs = (clusters: ClusterInternal[]) => {
+        return clusters.filter(c => {
+          const w = c.maxX - c.minX;
+          const h = c.maxY - c.minY;
+          return c.weight >= minPixelWeight && w <= 50 && h <= 80 && h >= 4;
+        }).sort((a, b) => b.weight - a.weight).slice(0, 11);
       };
 
-      const validDark = applyNMS(rawClusters.Dark);
-      const validLight = applyNMS(rawClusters.Light);
+      const validDark = filterPlayerBlobs(rawClusters.Dark);
+      const validLight = filterPlayerBlobs(rawClusters.Light);
 
       const players: Record<string, PlayerDetection> = {};
       const debugBoxes: Array<{ minX: number; minY: number; maxX: number; maxY: number; team: string; weight: number }> = [];
@@ -388,7 +395,7 @@ export default function Home() {
     }
 
     animFrameRef.current = requestAnimationFrame(runVisionLoop);
-  }, [isPlaying, homographyMatrix, pitchCorners, k1Distortion, luminanceThreshold, clusteringRadius, minPixelWeight, motionSensitivity]);
+  }, [isPlaying, homographyMatrix, polygonPoints, k1Distortion, luminanceThreshold, clusteringRadius, minPixelWeight, motionSensitivity]);
 
   useEffect(() => {
     if (isPlaying) {
@@ -402,35 +409,36 @@ export default function Home() {
   }, [isPlaying, runVisionLoop]);
 
   const handleVideoClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (homographyMatrix || !containerRef.current || !videoRef.current) return;
+    if (isLocked || !containerRef.current || !videoRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
     const x = Math.round((e.clientX - rect.left) * (videoRef.current.videoWidth / rect.width));
     const y = Math.round((e.clientY - rect.top) * (videoRef.current.videoHeight / rect.height));
     
-    if (calibrationStep === 'corners') {
-      const newCorners = [...pitchCorners, { x, y }];
-      setPitchCorners(newCorners);
-      if (newCorners.length === 4) {
-        const sorted = sortFourCorners(newCorners);
-        if (sorted) {
-          setPitchCorners(sorted);
-          const undistortedSrcPoints = sorted.map(pt => 
-            undistortCoordinate(pt.x, pt.y, videoRef.current!.videoWidth, videoRef.current!.videoHeight, k1Distortion)
-          );
-          const dstPoints = [
-            { x: 0, y: 0 },    // Top-Left
-            { x: 105, y: 0 },  // Top-Right
-            { x: 105, y: 68 }, // Bottom-Right
-            { x: 0, y: 68 }    // Bottom-Left
-          ];
-          setHomographyMatrix(solveHomography(undistortedSrcPoints, dstPoints));
-          captureBackgroundFrame();
-          setCalibrationStep('ready');
-          setIsPlaying(true);
-          videoRef.current.play();
-        }
-      }
-    }
+    setPolygonPoints(prev => [...prev, { x, y }]);
+  };
+
+  const lockPolygonAndStart = () => {
+    if (polygonPoints.length < 4 || !videoRef.current) return;
+
+    const sortedCorners = extractFourCornersFromPolygon(polygonPoints);
+    if (!sortedCorners) return;
+
+    const undistortedSrcPoints = sortedCorners.map(pt => 
+      undistortCoordinate(pt.x, pt.y, videoRef.current!.videoWidth, videoRef.current!.videoHeight, k1Distortion)
+    );
+
+    const dstPoints = [
+      { x: 0, y: 0 },    // Top-Left
+      { x: 105, y: 0 },  // Top-Right
+      { x: 105, y: 68 }, // Bottom-Right
+      { x: 0, y: 68 }    // Bottom-Left
+    ];
+
+    setHomographyMatrix(solveHomography(undistortedSrcPoints, dstPoints));
+    captureBackgroundFrame();
+    setIsLocked(true);
+    setIsPlaying(true);
+    videoRef.current.play();
   };
 
   const getScale = () => {
@@ -450,7 +458,7 @@ export default function Home() {
       <div className="w-full border-b border-neutral-800 px-6 py-3 bg-neutral-900 flex justify-between items-center z-50">
         <div className="flex items-center gap-3">
           <div className={`w-2 h-2 ${isPlaying ? 'bg-emerald-500 animate-pulse' : 'bg-neutral-500'}`}></div>
-          <span className="text-xs font-bold tracking-widest text-white uppercase">TACTICAL RADAR V14.0 [MOTION SUBTRACTION + CLEAN HOMOGRAPHY]</span>
+          <span className="text-xs font-bold tracking-widest text-white uppercase">TACTICAL RADAR V16.0 [FREEFORM POLYGON + STRICT PLAYER SIZING]</span>
         </div>
         <div className="flex items-center gap-4">
           <span className="text-[11px] text-neutral-400 font-semibold uppercase tracking-wider">SOURCE FEED:</span>
@@ -473,12 +481,12 @@ export default function Home() {
                     <span className="text-[10px] uppercase font-bold text-cyan-400">Lens Un-Bender (k1)</span>
                     <span className="text-[10px] text-neutral-400">{k1Distortion.toFixed(6)}</span>
                   </div>
-                  <input type="range" min="-0.00005" max="0.00005" step="0.000001" value={k1Distortion} onChange={(e) => setK1Distortion(parseFloat(e.target.value))} className="w-full cursor-pointer accent-cyan-500" disabled={homographyMatrix !== null}/>
+                  <input type="range" min="-0.00005" max="0.00005" step="0.000001" value={k1Distortion} onChange={(e) => setK1Distortion(parseFloat(e.target.value))} className="w-full cursor-pointer accent-cyan-500" disabled={isLocked}/>
                 </div>
 
                 <div className="flex flex-col gap-2">
                   <div className="flex justify-between items-center">
-                    <span className="text-[10px] uppercase font-bold text-teal-400">Motion Sensitivity (Ignore Grass)</span>
+                    <span className="text-[10px] uppercase font-bold text-teal-400">Motion Sensitivity</span>
                     <span className="text-[10px] text-neutral-400">{motionSensitivity}</span>
                   </div>
                   <input type="range" min="10" max="80" step="1" value={motionSensitivity} onChange={(e) => setMotionSensitivity(parseInt(e.target.value))} className="w-full cursor-pointer accent-teal-500"/>
@@ -502,10 +510,10 @@ export default function Home() {
 
                 <div className="flex flex-col gap-2">
                   <div className="flex justify-between items-center">
-                    <span className="text-[10px] uppercase font-bold text-red-400">Ghost Filter (Min Pixel Mass)</span>
+                    <span className="text-[10px] uppercase font-bold text-red-400">Min Pixel Mass</span>
                     <span className="text-[10px] text-neutral-400">{minPixelWeight} px</span>
                   </div>
-                  <input type="range" min="1" max="25" step="1" value={minPixelWeight} onChange={(e) => setMinPixelWeight(parseInt(e.target.value))} className="w-full cursor-pointer accent-red-500"/>
+                  <input type="range" min="1" max="20" step="1" value={minPixelWeight} onChange={(e) => setMinPixelWeight(parseInt(e.target.value))} className="w-full cursor-pointer accent-red-500"/>
                 </div>
 
                 <div className="flex items-center justify-between border-t border-neutral-800 pt-3">
@@ -518,8 +526,9 @@ export default function Home() {
               <div className="flex flex-col gap-2 border border-neutral-800 p-3 bg-black rounded">
                 <div className="flex justify-between items-center">
                   <span className="text-[11px] font-bold tracking-wider uppercase text-amber-500">
-                    {calibrationStep === 'corners' && `CLICK 4 PITCH CORNERS IN ORDER (${pitchCorners.length}/4): TL -> TR -> BR -> BL`}
-                    {calibrationStep === 'ready' && 'STATUS: MATRIX LOCKED - LIVE MOTION TRACKING'}
+                    {!isLocked 
+                      ? `CLICK FREEFORM NODES AROUND FIELD BOUNDARY (${polygonPoints.length} nodes)`
+                      : 'STATUS: MESH LOCKED - LIVE PLAYER TRACKING'}
                   </span>
                   <button onClick={resetCalibration} className="text-[9px] text-neutral-400 hover:text-white underline">RESET</button>
                 </div>
@@ -528,11 +537,11 @@ export default function Home() {
               <div ref={containerRef} onClick={handleVideoClick} style={{ aspectRatio: videoAspect }} className="relative border-2 border-neutral-800 bg-black cursor-crosshair w-full overflow-hidden shrink-0">
                 <video ref={videoRef} src={videoSrc} onLoadedMetadata={handleLoadedMetadata} className="w-full h-full object-fill opacity-90 pointer-events-none" muted playsInline />
                 
-                {/* Calibration Polygon Area */}
-                {pitchCorners.length > 0 && (
+                {/* Freeform Polygon Mask */}
+                {polygonPoints.length > 0 && (
                   <svg className="absolute top-0 left-0 w-full h-full pointer-events-none z-10">
                     <polygon 
-                      points={pitchCorners.map(p => `${p.x * scaleX},${p.y * scaleY}`).join(" ")} 
+                      points={polygonPoints.map(p => `${p.x * scaleX},${p.y * scaleY}`).join(" ")} 
                       fill="rgba(6, 182, 212, 0.15)" 
                       stroke="#06b6d4" 
                       strokeWidth="2" 
@@ -540,9 +549,9 @@ export default function Home() {
                   </svg>
                 )}
 
-                {/* Pitch Corner Markers */}
-                {pitchCorners.map((pt, idx) => (
-                  <div key={`corner-${idx}`} style={{ left: (pt.x * scaleX) - 6, top: (pt.y * scaleY) - 6 }} className="absolute w-3 h-3 border-2 border-amber-500 bg-black z-20 flex items-center justify-center rounded-sm">
+                {/* Polygon Node Markers */}
+                {polygonPoints.map((pt, idx) => (
+                  <div key={`node-${idx}`} style={{ left: (pt.x * scaleX) - 6, top: (pt.y * scaleY) - 6 }} className="absolute w-3 h-3 border-2 border-amber-500 bg-black z-20 flex items-center justify-center rounded-sm">
                     <span className="text-[8px] text-amber-400 font-bold absolute -top-3">{idx + 1}</span>
                   </div>
                 ))}
@@ -557,14 +566,20 @@ export default function Home() {
                   return (
                     <div 
                       key={`debug-box-${idx}`}
-                      style={{ left, top, width: Math.max(width, 12), height: Math.max(height, 12), borderColor: color }}
+                      style={{ left, top, width: Math.max(width, 10), height: Math.max(height, 10), borderColor: color }}
                       className="absolute border border-dashed bg-white/10 z-30 pointer-events-none flex items-start p-0.5"
                     >
-                      <span className="text-[8px] text-white bg-black/80 px-1 font-bold">{box.weight}px</span>
+                      <span className="text-[7px] text-white bg-black/80 px-0.5 font-bold">{box.weight}px</span>
                     </div>
                   );
                 })}
               </div>
+
+              {!isLocked && polygonPoints.length >= 4 && (
+                <button onClick={lockPolygonAndStart} className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-black font-black text-[11px] tracking-[0.2em] uppercase rounded-sm transition">
+                  LOCK MESH & START TRACKING
+                </button>
+              )}
 
             </div>
           ) : (
