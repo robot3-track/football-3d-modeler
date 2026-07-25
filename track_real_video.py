@@ -5,13 +5,21 @@ import os
 
 print("Initializing Pure-CV Local Tracking Engine (No PyTorch)...")
 
-# 1. SETUP HOMOGRAPHY (Maps pixels to the 105m x 68m grid)
+# 1. SETUP HOMOGRAPHY Matrix Mappings
+# These pixel markers must be adjusted if your UI resolution scale changes
 pts_src = np.array([
-    [350, 200], [800, 220], [950, 600], [200, 550]
+    [350, 200], # 1. Top-Left click
+    [800, 220], # 2. Top-Right click
+    [950, 600], # 3. Bottom-Right click
+    [200, 550]  # 4. Bottom-Left click
 ], dtype=float)
 
+# FIXED: Mapped click points to the full 105m x 68m boundaries instead of a partial penalty box
 pts_dst = np.array([
-    [0, 18], [16.5, 18], [16.5, 50], [0, 50]
+    [0, 0],      # 1. Top-Left Corner of Pitch
+    [105, 0],    # 2. Top-Right Corner of Pitch
+    [105, 68],   # 3. Bottom-Right Corner of Pitch
+    [0, 68]      # 4. Bottom-Left Corner of Pitch
 ], dtype=float)
 
 H, _ = cv2.findHomography(pts_src, pts_dst)
@@ -25,11 +33,6 @@ def convert_to_pitch_coords(pixel_x, pixel_y, homography_matrix):
 net = cv2.dnn.readNet("yolov3.weights", "yolov3.cfg")
 layer_names = net.getLayerNames()
 output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
-
-# Load class labels (we only care about class 0: person)
-with open(os.devnull, "w") as f:
-    # Just an array filter check for person objects
-    classes = ["person"]
 
 # 3. OPEN REAL VIDEO FEED
 video_path = "match_sample.mp4"
@@ -55,47 +58,76 @@ while cap.isOpened():
     net.setInput(blob)
     outs = net.forward(output_layers)
     
-    frame_data = {}
-    person_idx = 0
+    boxes = []
+    confidences = []
     
-    # Parse bounding boxes
+    # Parse raw detection footprints
     for out in outs:
         for detection in out:
             scores = detection[5:]
             class_id = np.argmax(scores)
             confidence = scores[class_id]
             
-            # Confidence threshold for human tracking
+            # Extract person class (0) with structural confidence threshold filter
             if class_id == 0 and confidence > 0.4:
                 center_x = int(detection[0] * width)
                 center_y = int(detection[1] * height)
                 w = int(detection[2] * width)
                 h = int(detection[3] * height)
                 
-                # Bottom mid point of the bounding box (the player's feet)
-                feet_x = center_x
-                feet_y = center_y + (h / 2)
+                # Transform to standard top-left bounding box anchors
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
                 
-                pitch_x, pitch_z = convert_to_pitch_coords(feet_x, feet_y, H)
-                
+                boxes.append([x, y, w, h])
+                confidences.append(float(confidence))
+    
+    # FIXED: Non-Maximum Suppression added to deduplicate hundreds of duplicate ghost overlapping boxes
+    indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.4, 0.3)
+    
+    frame_players = {}
+    person_idx = 0
+    
+    if len(indices) > 0:
+        flat_indices = indices.flatten() if hasattr(indices, 'flatten') else indices
+        
+        for index in flat_indices:
+            bx, by, bw, bh = boxes[index]
+            
+            # Ground anchor alignment logic: bottom-mid point of the bounding box
+            feet_x = bx + (bw / 2)
+            feet_y = by + bh
+            
+            pitch_x, pitch_z = convert_to_pitch_coords(feet_x, feet_y, H)
+            
+            # Check bounding frame threshold limits
+            if -10 <= pitch_x <= 115 and -10 <= pitch_z <= 78:
                 person_idx += 1
-                # Alternate teams simply by object indexing parity for data structuring
                 team = "A" if person_idx % 2 == 0 else "B"
                 
-                frame_data[str(person_idx)] = {"x": pitch_x, "z": pitch_z, "team": team}
+                # FIXED: Maps out both 'y' and 'z' coordinate properties to prevent 3D engine flattening bugs
+                frame_players[str(person_idx)] = {
+                    "x": pitch_x, 
+                    "y": pitch_z, 
+                    "z": pitch_z, 
+                    "team": team
+                }
                 
-    tracking_timeline[str(frame_count)] = frame_data
+    tracking_timeline[str(frame_count)] = {
+        "players": frame_players,
+        "ball": None
+    }
     
-    if frame_count >= 200: # process a 200 frame sample segment
+    if frame_count >= 200: 
         break
 
 cap.release()
 
-# 4. EXPORT JSON DIRECTLY INTO THE NEXT.JS PATHWAY
+# 4. EXPORT JSON DATA MATRIX DIRECTLY INTO THE PUBLIC FOLDER
 output_path = os.path.join("public", "tracking_data.json")
 os.makedirs("public", exist_ok=True)
 
 with open(output_path, 'w') as f:
     json.dump(tracking_timeline, f, indent=2)
 
-print(f"Success! Real video positions saved directly to: {output_path}")
+print(f"\nSUCCESS: Radar tracking telemetry assets exported to -> {output_path}")

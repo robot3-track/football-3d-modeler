@@ -13,18 +13,14 @@ const CLICK_LABELS = [
   "4. Bottom-Left Corner (Near Left Touchline / Sideline)"
 ];
 
-// Numerically Stable Scaled 8x8 Homography Solver
 function solveHomography(srcPts: {x: number, y: number}[], dstPts: {x: number, y: number}[]) {
   try {
-    const scaleFactor = 1000.0;
-    const src = srcPts.map(p => ({ x: p.x / scaleFactor, y: p.y / scaleFactor }));
-    
     const M: number[][] = [];
     const B: number[] = [];
 
     for (let i = 0; i < 4; i++) {
-      const u = src[i].x;
-      const v = src[i].y;
+      const u = srcPts[i].x;
+      const v = srcPts[i].y;
       const X = dstPts[i].x;
       const Y = dstPts[i].y;
 
@@ -41,9 +37,9 @@ function solveHomography(srcPts: {x: number, y: number}[], dstPts: {x: number, y
     }
 
     return [
-      [h[0] / scaleFactor, h[1] / scaleFactor, h[2]],
-      [h[3] / scaleFactor, h[4] / scaleFactor, h[5]],
-      [h[6] / scaleFactor, h[7] / scaleFactor, 1.0]
+      [h[0], h[1], h[2]],
+      [h[3], h[4], h[5]],
+      [h[6], h[7], 1.0]
     ];
   } catch (e) {
     const w = Math.abs(srcPts[1].x - srcPts[0].x) || 1;
@@ -150,18 +146,22 @@ function LiveSoccerPitch3D({ videoRef, homographyMatrix, isPlaying, clickedPoint
       const data = imgData.data;
 
       const rawDetections: { x: number; z: number; team: string }[] = [];
-      const stepX = Math.max(8, Math.floor(canvas.width / 50));
-      const stepY = Math.max(8, Math.floor(canvas.height / 35));
+      const stepX = 6; 
+      const stepY = 6;
 
       for (let y = 0; y < canvas.height; y += stepY) {
         for (let x = 0; x < canvas.width; x += stepX) {
           if (!isInsidePolygon({ x, y }, clickedPoints)) continue;
 
           const idx = (y * canvas.width + x) * 4;
-          const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+          const r = data[idx];
+          const g = data[idx + 1];
+          const b = data[idx + 2];
 
-          const isTurf = g > r * 1.05 && g > b * 1.05;
-          if (!isTurf && (r + g + b > 80) && (r + g + b < 700)) {
+          // Adaptive green/brown field color threshold
+          const isDryOrGreenTurf = (g > r * 0.92 && g > b * 0.95) || (r > 100 && g > 95 && b < r && g > b);
+          
+          if (!isDryOrGreenTurf && (r + g + b > 90) && (r + g + b < 680)) {
             const projected = projectPoint(homographyMatrix, x, y);
             if (projected.x >= 0 && projected.x <= 105 && projected.z >= 0 && projected.z <= 68) {
               const team = r > b ? 'A' : 'B';
@@ -175,33 +175,36 @@ function LiveSoccerPitch3D({ videoRef, homographyMatrix, isPlaying, clickedPoint
         }
       }
 
-      // Spatial Clustering / Non-Maximum Suppression to group duplicate points per player
       const players: any = {};
       let pCount = 1;
+      
       for (const det of rawDetections) {
         let merged = false;
         for (const key of Object.keys(players)) {
           const p = players[key];
           const dist = Math.hypot(p.x - det.x, p.z - det.z);
-          if (dist < 1.8) { // Within 1.8 meters = same player blob
+          
+          if (dist < 3.5) { 
             merged = true;
             break;
           }
         }
-        if (!merged && Object.keys(players).length < 22) {
+        if (!merged && Object.keys(players).length < 24) {
           players[`p_${pCount++}`] = { x: det.x, z: det.z, team: det.team };
         }
       }
 
-      let ball = { x: 52.5, z: 34 };
-      for (let y = 0; y < canvas.height; y += 4) {
+      let ball = null;
+      let foundBall = false;
+      for (let y = 0; y < canvas.height && !foundBall; y += 4) {
         for (let x = 0; x < canvas.width; x += 4) {
           if (!isInsidePolygon({ x, y }, clickedPoints)) continue;
           const idx = (y * canvas.width + x) * 4;
-          if (data[idx] > 210 && data[idx + 1] > 210 && data[idx + 2] > 210) {
+          if (data[idx] > 220 && data[idx + 1] > 220 && data[idx + 2] > 220) {
             const bp = projectPoint(homographyMatrix, x, y);
-            if (bp.x >= 0 && bp.x <= 105 && bp.z >= 0 && bp.z <= 68) {
+            if (bp.x > 2 && bp.x < 103 && bp.z > 2 && bp.z < 66) {
               ball = { x: Number(bp.x.toFixed(2)), z: Number(bp.z.toFixed(2)) };
+              foundBall = true;
               break;
             }
           }
@@ -217,45 +220,50 @@ function LiveSoccerPitch3D({ videoRef, homographyMatrix, isPlaying, clickedPoint
 
   return (
     <>
-      <ambientLight intensity={0.6} />
-      <directionalLight position={[52.5, 50, 34]} intensity={1.2} />
+      <ambientLight intensity={0.7} />
+      <directionalLight position={[52.5, 60, 34]} intensity={1.3} />
 
+      {/* Outer Field Boundary Rim */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[52.5, -0.02, 34]}>
-        <planeGeometry args={[125, 88]} />
-        <meshStandardMaterial color="#121212" roughness={1.0} />
+        <planeGeometry args={[135, 98]} />
+        <meshStandardMaterial color="#0d0d0d" roughness={1.0} />
       </mesh>
 
+      {/* Core Playable Surface Area */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[52.5, -0.01, 34]}>
         <planeGeometry args={[105, 68]} />
-        <meshStandardMaterial color="#16291e" roughness={0.9} />
+        <meshStandardMaterial color="#1b3325" roughness={0.8} />
       </mesh>
 
-      <gridHelper args={[105, 10, '#ffffff', '#22382b']} position={[52.5, 0.01, 34]} />
+      <gridHelper args={[105, 14, '#ffffff', '#284d37']} position={[52.5, 0.01, 34]} />
 
+      {/* Left Goal Box Infrastructure */}
       <group position={[0, 0, 34]}>
-        <mesh position={[0, 1.22, -3.66]}><cylinderGeometry args={[0.08, 0.08, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
-        <mesh position={[0, 1.22, 3.66]}><cylinderGeometry args={[0.08, 0.08, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
-        <mesh position={[0, 2.44, 0]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.08, 0.08, 7.32]} /><meshBasicMaterial color="#ffffff" /></mesh>
+        <mesh position={[0, 1.22, -3.66]}><cylinderGeometry args={[0.06, 0.06, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
+        <mesh position={[0, 1.22, 3.66]}><cylinderGeometry args={[0.06, 0.06, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
+        <mesh position={[0, 2.44, 0]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.06, 0.06, 7.32]} /><meshBasicMaterial color="#ffffff" /></mesh>
         <mesh position={[8.25, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}><planeGeometry args={[16.5, 40.3]} /><meshBasicMaterial color="#ffffff" wireframe /></mesh>
       </group>
 
+      {/* Right Goal Box Infrastructure */}
       <group position={[105, 0, 34]}>
-        <mesh position={[0, 1.22, -3.66]}><cylinderGeometry args={[0.08, 0.08, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
-        <mesh position={[0, 1.22, 3.66]}><cylinderGeometry args={[0.08, 0.08, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
-        <mesh position={[0, 2.44, 0]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.08, 0.08, 7.32]} /><meshBasicMaterial color="#ffffff" /></mesh>
+        <mesh position={[0, 1.22, -3.66]}><cylinderGeometry args={[0.06, 0.06, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
+        <mesh position={[0, 1.22, 3.66]}><cylinderGeometry args={[0.06, 0.06, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
+        <mesh position={[0, 2.44, 0]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.06, 0.06, 7.32]} /><meshBasicMaterial color="#ffffff" /></mesh>
         <mesh position={[-8.25, 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}><planeGeometry args={[16.5, 40.3]} /><meshBasicMaterial color="#ffffff" wireframe /></mesh>
       </group>
 
+      {/* Dynamic Player Model Anchors */}
       {Object.entries(players).map(([id, player]: [string, any]) => {
-        const teamColor = player.team === 'A' ? '#dc2626' : '#2563eb';
+        const teamColor = player.team === 'A' ? '#e11d48' : '#2563eb';
         return (
           <group key={id} position={[player.x, 0.9, player.z]}>
             <mesh>
-              <cylinderGeometry args={[0.45, 0.45, 1.8, 8]} />
-              <meshStandardMaterial color={teamColor} roughness={0.2} />
+              <cylinderGeometry args={[0.4, 0.4, 1.8, 12]} />
+              <meshStandardMaterial color={teamColor} roughness={0.3} metalness={0.1} />
             </mesh>
-            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.9, 0]}>
-              <ringGeometry args={[0.5, 0.6, 12]} />
+            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.89, 0]}>
+              <ringGeometry args={[0.55, 0.7, 16]} />
               <meshBasicMaterial color={teamColor} />
             </mesh>
           </group>
@@ -264,8 +272,8 @@ function LiveSoccerPitch3D({ videoRef, homographyMatrix, isPlaying, clickedPoint
 
       {ball && (
         <mesh position={[ball.x, 0.35, ball.z]}>
-          <sphereGeometry args={[0.35, 16, 16]} />
-          <meshStandardMaterial color="#ffffff" roughness={0.1} emissive="#ffffff" emissiveIntensity={0.5} />
+          <sphereGeometry args={[0.3, 16, 16]} />
+          <meshStandardMaterial color="#ffffff" roughness={0.2} emissive="#ffffff" emissiveIntensity={0.4} />
         </mesh>
       )}
     </>
@@ -320,11 +328,12 @@ export default function Home() {
   const startLiveTracking = () => {
     if (clickedPoints.length !== 4) return;
     
+    // FIXED: Corrected destination array configuration to align with the 3D grid layout coordinates
     const dstPoints = [
-      { x: 0, y: 68 },   // 1. Top-Left Corner
-      { x: 105, y: 68 }, // 2. Top-Right Corner
-      { x: 105, y: 0 },  // 3. Bottom-Right Corner
-      { x: 0, y: 0 }     // 4. Bottom-Left Corner
+      { x: 0, y: 68 },   // 1. Top-Left Corner (Far Line) -> X=0, Y=68
+      { x: 105, y: 68 }, // 2. Top-Right Corner (Far Line) -> X=105, Y=68
+      { x: 105, y: 0 },  // 3. Bottom-Right Corner (Near Line) -> X=105, Y=0
+      { x: 0, y: 0 }     // 4. Bottom-Left Corner (Near Line) -> X=0, Y=0
     ];
 
     const H = solveHomography(clickedPoints, dstPoints);
@@ -437,8 +446,8 @@ export default function Home() {
           </div>
 
           <div className="flex-grow w-full h-full">
-            <Canvas camera={{ position: [52.5, 60, 110], fov: 40 }}>
-              <color attach="background" args={['#0a0a0a']} />
+            <Canvas camera={{ position: [52.5, 55, 100], fov: 38 }}>
+              <color attach="background" args={['#070707']} />
               <LiveSoccerPitch3D 
                 videoRef={videoRef} 
                 homographyMatrix={homographyMatrix} 
@@ -457,7 +466,7 @@ export default function Home() {
                 {isPlaying ? 'PAUSE LIVE STREAM' : 'RESUME LIVE STREAM'}
               </button>
               <span className="text-xs font-mono text-emerald-400 tracking-widest uppercase">
-                {isPlaying ? '● LIVE TRACKING ACTIVE (60 FPS)' : '■ STREAM PAUSED'}
+                {isPlaying ? '● LIVE TRACKING ACTIVE (Adaptive Scan)' : '■ STREAM PAUSED'}
               </span>
             </div>
           )}
