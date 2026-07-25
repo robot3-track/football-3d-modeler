@@ -1,13 +1,24 @@
 'use client';
 
-import React, { useState, useRef, useEffect } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Canvas } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
 
 // --- INTERFACES ---
 interface Point { x: number; y: number; label?: string; }
-interface PlayerDetection { x: number; z: number; team: 'Dark' | 'Light'; weight?: number; }
-interface FrameData { players: Record<string, PlayerDetection>; ball: { x: number; z: number } | null; }
+interface PlayerDetection { 
+  id: string;
+  x: number; 
+  z: number; 
+  team: 'Dark' | 'Light'; 
+  weight?: number;
+  box?: { minX: number; minY: number; maxX: number; maxY: number };
+}
+interface FrameData { 
+  players: Record<string, PlayerDetection>; 
+  ball: { x: number; z: number } | null;
+  debugBoxes: Array<{ minX: number; minY: number; maxX: number; maxY: number; team: string; weight: number }>;
+}
 
 // --- MATH HELPERS & LENS CORRECTION ---
 function undistortCoordinate(x: number, y: number, width: number, height: number, k1: number) {
@@ -25,20 +36,16 @@ function undistortCoordinate(x: number, y: number, width: number, height: number
   };
 }
 
-/**
- * Sorts exactly 4 points into Top-Left, Top-Right, Bottom-Right, Bottom-Left
- * based on standard broadcast camera orientations.
- */
 function sortFourCorners(pts: Point[]) {
   if (pts.length !== 4) return null;
   const sortedByY = [...pts].sort((a, b) => a.y - b.y);
   const topTwo = sortedByY.slice(0, 2).sort((a, b) => a.x - b.x);
   const botTwo = sortedByY.slice(2, 4).sort((a, b) => a.x - b.x);
   return [
-    topTwo[0], // Top-Left (Far left)
-    topTwo[1], // Top-Right (Far right)
-    botTwo[1], // Bottom-Right (Near right)
-    botTwo[0]  // Bottom-Left (Near left)
+    topTwo[0], // Top-Left
+    topTwo[1], // Top-Right
+    botTwo[1], // Bottom-Right
+    botTwo[0]  // Bottom-Left
   ];
 }
 
@@ -56,7 +63,6 @@ function solveHomography(srcPts: Point[], dstPts: Point[]) {
     if (!h || h.some(val => isNaN(val) || !isFinite(val))) throw new Error("Matrix singular");
     return [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1.0]];
   } catch (e) {
-    // Fallback scaling if exact homography fails
     const w = Math.abs(srcPts[1].x - srcPts[0].x) || 1;
     const h = Math.abs(srcPts[3].y - srcPts[0].y) || 1;
     return [[105 / w, 0, -srcPts[0].x * (105 / w)], [0, 68 / h, -srcPts[0].y * (68 / h)], [0, 0, 1.0]];
@@ -93,7 +99,13 @@ function gaussianElimination8x8(A: number[][], b: number[]): number[] | null {
 function projectPoint(H: number[][], u: number, v: number) {
   const W = H[2][0] * u + H[2][1] * v + H[2][2];
   if (Math.abs(W) < 1e-6) return { x: 52.5, z: 34 };
-  return { x: (H[0][0] * u + H[0][1] * v + H[0][2]) / W, z: (H[1][0] * u + H[1][1] * v + H[1][2]) / W };
+  const rawX = (H[0][0] * u + H[0][1] * v + H[0][2]) / W;
+  const rawZ = (H[1][0] * u + H[1][1] * v + H[1][2]) / W;
+  // Strict clamping to prevent out-of-bounds projections stacking on edges
+  return {
+    x: Math.max(2, Math.min(103, rawX)),
+    z: Math.max(2, Math.min(66, rawZ))
+  };
 }
 
 function isInsidePolygon(pt: { x: number; y: number }, polygon: Point[]) {
@@ -117,144 +129,35 @@ function RealisticPitchMarkings() {
 
   return (
     <group>
-      {/* Base Grass */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[52.5, -0.02, 34]}>
         <planeGeometry args={[135, 98]} />
         <meshStandardMaterial color="#1a2e21" roughness={1.0} />
       </mesh>
-      
       {stripes}
-      
       <group position={[0, 0.02, 0]}>
-        {/* Bounds */}
         <mesh position={[52.5, 0, 0]}><boxGeometry args={[105, 0.05, 0.2]} /><meshBasicMaterial color="white" /></mesh>
         <mesh position={[52.5, 0, 68]}><boxGeometry args={[105, 0.05, 0.2]} /><meshBasicMaterial color="white" /></mesh>
         <mesh position={[0, 0, 34]}><boxGeometry args={[0.2, 0.05, 68]} /><meshBasicMaterial color="white" /></mesh>
         <mesh position={[105, 0, 34]}><boxGeometry args={[0.2, 0.05, 68]} /><meshBasicMaterial color="white" /></mesh>
-        
-        {/* Center */}
         <mesh position={[52.5, 0, 34]}><boxGeometry args={[0.2, 0.05, 68]} /><meshBasicMaterial color="white" /></mesh>
         <mesh position={[52.5, 0, 34]} rotation={[-Math.PI / 2, 0, 0]}><ringGeometry args={[9.05, 9.25, 64]} /><meshBasicMaterial color="white" /></mesh>
         <mesh position={[52.5, 0, 34]}><cylinderGeometry args={[0.3, 0.3, 0.05, 16]} /><meshBasicMaterial color="white" /></mesh>
         
-        {/* Left Boxes */}
+        {/* Left Box */}
         <mesh position={[16.5, 0, 34]}><boxGeometry args={[0.2, 0.05, 40.32]} /><meshBasicMaterial color="white" /></mesh>
         <mesh position={[8.25, 0, 13.84]}><boxGeometry args={[16.5, 0.05, 0.2]} /><meshBasicMaterial color="white" /></mesh>
         <mesh position={[8.25, 0, 54.16]}><boxGeometry args={[16.5, 0.05, 0.2]} /><meshBasicMaterial color="white" /></mesh>
-        <mesh position={[5.5, 0, 34]}><boxGeometry args={[0.2, 0.05, 18.32]} /><meshBasicMaterial color="white" /></mesh>
-        <mesh position={[2.75, 0, 24.84]}><boxGeometry args={[5.5, 0.05, 0.2]} /><meshBasicMaterial color="white" /></mesh>
-        <mesh position={[2.75, 0, 43.16]}><boxGeometry args={[5.5, 0.05, 0.2]} /><meshBasicMaterial color="white" /></mesh>
 
-        {/* Right Boxes */}
+        {/* Right Box */}
         <mesh position={[105 - 16.5, 0, 34]}><boxGeometry args={[0.2, 0.05, 40.32]} /><meshBasicMaterial color="white" /></mesh>
         <mesh position={[105 - 8.25, 0, 13.84]}><boxGeometry args={[16.5, 0.05, 0.2]} /><meshBasicMaterial color="white" /></mesh>
         <mesh position={[105 - 8.25, 0, 54.16]}><boxGeometry args={[16.5, 0.05, 0.2]} /><meshBasicMaterial color="white" /></mesh>
-        <mesh position={[105 - 5.5, 0, 34]}><boxGeometry args={[0.2, 0.05, 18.32]} /><meshBasicMaterial color="white" /></mesh>
-        <mesh position={[105 - 2.75, 0, 24.84]}><boxGeometry args={[5.5, 0.05, 0.2]} /><meshBasicMaterial color="white" /></mesh>
-        <mesh position={[105 - 2.75, 0, 43.16]}><boxGeometry args={[5.5, 0.05, 0.2]} /><meshBasicMaterial color="white" /></mesh>
       </group>
     </group>
   );
 }
 
-// --- CORE COMPUTER VISION PIPELINE ---
-function LiveSoccerPitch3D({ 
-  videoRef, homographyMatrix, isPlaying, maskPoints, liveFrameData, setLiveFrameData, 
-  k1Distortion, luminanceThreshold, clusteringRadius, minPixelWeight 
-}: any) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  useEffect(() => {
-    if (!canvasRef.current) canvasRef.current = document.createElement('canvas');
-  }, []);
-
-  useFrame(() => {
-    if (!isPlaying || !videoRef.current || !homographyMatrix || maskPoints.length < 3 || videoRef.current.paused) return;
-
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || video.videoWidth === 0) return;
-    if (canvas.width !== video.videoWidth) {
-      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    }
-
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return;
-
-    try {
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const data = imgData.data;
-
-      const rawClusters: { Dark: PlayerDetection[], Light: PlayerDetection[] } = { Dark: [], Light: [] };
-      const stepX = 6, stepY = 6;
-
-      for (let y = 0; y < canvas.height; y += stepY) {
-        for (let x = 0; x < canvas.width; x += stepX) {
-          // Verify pixel is inside the Mask Boundary
-          if (!isInsidePolygon({ x, y }, maskPoints)) continue;
-
-          const idx = (y * canvas.width + x) * 4;
-          const r = data[idx], g = data[idx + 1], b = data[idx + 2];
-
-          // Turf exclusion heuristics
-          const isStandardGreen = (g > r * 0.85 && g > b * 0.85);
-          const isDryTurf = (r > 100 && g > 90 && b < r && g > b);
-          const isDirtPatch = (r > 120 && g > 110 && b > 80 && Math.abs(r - g) < 30);
-          
-          if (!isStandardGreen && !isDryTurf && !isDirtPatch) {
-            const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-
-            if (luminance > 20 && luminance < 245) {
-              const undistorted = undistortCoordinate(x, y, canvas.width, canvas.height, k1Distortion);
-              const projected = projectPoint(homographyMatrix, undistorted.x, undistorted.y);
-
-              // 105x68 dimension check
-              if (projected.x >= 0 && projected.x <= 105 && projected.z >= 0 && projected.z <= 68) {
-                const team = luminance >= luminanceThreshold ? 'Light' : 'Dark';
-                let merged = false;
-
-                for (let c of rawClusters[team]) {
-                  const dist = Math.hypot(c.x - projected.x, c.z - projected.z);
-                  if (dist < clusteringRadius) {
-                    c.x = ((c.x * (c.weight || 1)) + projected.x) / ((c.weight || 1) + 1);
-                    c.z = ((c.z * (c.weight || 1)) + projected.z) / ((c.weight || 1) + 1);
-                    c.weight = (c.weight || 1) + 1;
-                    merged = true;
-                    break;
-                  }
-                }
-                
-                if (!merged) {
-                  rawClusters[team].push({ x: projected.x, z: projected.z, team, weight: 1 });
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // Filter noise by mass, limit to 11 heaviest clusters per team
-      const validDark = rawClusters.Dark
-        .filter(c => (c.weight || 0) >= minPixelWeight)
-        .sort((a, b) => (b.weight || 0) - (a.weight || 0))
-        .slice(0, 11);
-
-      const validLight = rawClusters.Light
-        .filter(c => (c.weight || 0) >= minPixelWeight)
-        .sort((a, b) => (b.weight || 0) - (a.weight || 0))
-        .slice(0, 11);
-
-      const players: Record<string, PlayerDetection> = {};
-      let pCount = 1;
-      [...validDark, ...validLight].forEach(c => {
-        players[`p_${pCount++}`] = { x: Number(c.x.toFixed(2)), z: Number(c.z.toFixed(2)), team: c.team };
-      });
-
-      setLiveFrameData({ players, ball: null });
-    } catch (e) { console.error(e) }
-  });
-
+function LiveSoccerPitch3D({ liveFrameData }: any) {
   const players = liveFrameData?.players || {};
 
   return (
@@ -263,12 +166,14 @@ function LiveSoccerPitch3D({
       <directionalLight position={[52.5, 60, 34]} intensity={1.3} />
       <RealisticPitchMarkings />
 
+      {/* Goal 1 Structure */}
       <group position={[0, 0, 34]}>
         <mesh position={[0, 1.22, -3.66]}><cylinderGeometry args={[0.06, 0.06, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
         <mesh position={[0, 1.22, 3.66]}><cylinderGeometry args={[0.06, 0.06, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
         <mesh position={[0, 2.44, 0]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.06, 0.06, 7.32]} /><meshBasicMaterial color="#ffffff" /></mesh>
       </group>
 
+      {/* Goal 2 Structure */}
       <group position={[105, 0, 34]}>
         <mesh position={[0, 1.22, -3.66]}><cylinderGeometry args={[0.06, 0.06, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
         <mesh position={[0, 1.22, 3.66]}><cylinderGeometry args={[0.06, 0.06, 2.44]} /><meshBasicMaterial color="#ffffff" /></mesh>
@@ -296,22 +201,31 @@ export default function Home() {
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
   const [videoAspect, setVideoAspect] = useState<number>(16 / 9);
   
-  // DUAL STATE CALIBRATION
-  const [pitchCorners, setPitchCorners] = useState<Point[]>([]); // Strict 4 for Homography orientation
-  const [maskPoints, setMaskPoints] = useState<Point[]>([]);     // Freeform N points for bounds
-  const [isDrawingMask, setIsDrawingMask] = useState(false);
+  // CALIBRATION STATES (Strictly 4 Pitch Corners)
+  const [calibrationStep, setCalibrationStep] = useState<'corners' | 'ready'>('corners');
+  const [pitchCorners, setPitchCorners] = useState<Point[]>([]);
+  const [showDebugBoxes, setShowDebugBoxes] = useState<boolean>(true);
   
   const [homographyMatrix, setHomographyMatrix] = useState<number[][] | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [liveFrameData, setLiveFrameData] = useState<FrameData>({ players: {}, ball: null });
+  const [liveFrameData, setLiveFrameData] = useState<FrameData>({ players: {}, ball: null, debugBoxes: [] });
   
   const [k1Distortion, setK1Distortion] = useState<number>(0.0);
   const [luminanceThreshold, setLuminanceThreshold] = useState<number>(110);
   const [clusteringRadius, setClusteringRadius] = useState<number>(3.5);
-  const [minPixelWeight, setMinPixelWeight] = useState<number>(4);
+  const [minPixelWeight, setMinPixelWeight] = useState<number>(3);
+  const [motionSensitivity, setMotionSensitivity] = useState<number>(25);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const backgroundCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!canvasRef.current) canvasRef.current = document.createElement('canvas');
+    if (!backgroundCanvasRef.current) backgroundCanvasRef.current = document.createElement('canvas');
+  }, []);
 
   const handleVideoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files?.[0]) {
@@ -321,9 +235,9 @@ export default function Home() {
   };
 
   const resetCalibration = () => {
+    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     setPitchCorners([]);
-    setMaskPoints([]);
-    setIsDrawingMask(false);
+    setCalibrationStep('corners');
     setHomographyMatrix(null);
     setIsPlaying(false);
   };
@@ -334,51 +248,189 @@ export default function Home() {
     }
   };
 
+  // Capture background frame reference on start for motion differencing
+  const captureBackgroundFrame = () => {
+    if (!videoRef.current || !backgroundCanvasRef.current) return;
+    const bgCanvas = backgroundCanvasRef.current;
+    const video = videoRef.current;
+    bgCanvas.width = video.videoWidth;
+    bgCanvas.height = video.videoHeight;
+    const bgCtx = bgCanvas.getContext('2d', { willReadFrequently: true });
+    if (bgCtx) {
+      bgCtx.drawImage(video, 0, 0, bgCanvas.width, bgCanvas.height);
+    }
+  };
+
+  // Dedicated Robust Motion + Vision Loop via requestAnimationFrame
+  const runVisionLoop = useCallback(() => {
+    if (!isPlaying || !videoRef.current || !homographyMatrix || pitchCorners.length !== 4 || videoRef.current.paused) {
+      animFrameRef.current = requestAnimationFrame(runVisionLoop);
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    const bgCanvas = backgroundCanvasRef.current;
+    const video = videoRef.current;
+    if (!canvas || !bgCanvas || video.videoWidth === 0) {
+      animFrameRef.current = requestAnimationFrame(runVisionLoop);
+      return;
+    }
+
+    if (canvas.width !== video.videoWidth) {
+      canvas.width = video.videoWidth; 
+      canvas.height = video.videoHeight;
+    }
+
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const bgCtx = bgCanvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx || !bgCtx) {
+      animFrameRef.current = requestAnimationFrame(runVisionLoop);
+      return;
+    }
+
+    try {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const currImgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const bgImgData = bgCtx.getImageData(0, 0, canvas.width, canvas.height);
+      const currData = currImgData.data;
+      const bgData = bgImgData.data;
+
+      interface ClusterInternal {
+        x: number; z: number; team: 'Dark' | 'Light'; weight: number;
+        minX: number; maxX: number; minY: number; maxY: number;
+      }
+
+      const rawClusters: { Dark: ClusterInternal[], Light: ClusterInternal[] } = { Dark: [], Light: [] };
+      const stepX = 6, stepY = 6; 
+
+      for (let y = 0; y < canvas.height; y += stepY) {
+        for (let x = 0; x < canvas.width; x += stepX) {
+          if (!isInsidePolygon({ x, y }, pitchCorners)) continue;
+
+          const idx = (y * canvas.width + x) * 4;
+          const r = currData[idx], g = currData[idx + 1], b = currData[idx + 2];
+          const bgR = bgData[idx], bgG = bgData[idx + 1], bgB = bgData[idx + 2];
+
+          // MOTION DIFFERENCING: Check if pixel differs from static background (ignores grass & buildings!)
+          const diff = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
+
+          if (diff > motionSensitivity) {
+            const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+            const undistorted = undistortCoordinate(x, y, canvas.width, canvas.height, k1Distortion);
+            const projected = projectPoint(homographyMatrix, undistorted.x, undistorted.y);
+
+            const team = luminance >= luminanceThreshold ? 'Light' : 'Dark';
+            let merged = false;
+
+            for (let c of rawClusters[team]) {
+              const dist = Math.hypot(c.x - projected.x, c.z - projected.z);
+              if (dist < clusteringRadius) {
+                c.x = ((c.x * c.weight) + projected.x) / (c.weight + 1);
+                c.z = ((c.z * c.weight) + projected.z) / (c.weight + 1);
+                c.weight += 1;
+                c.minX = Math.min(c.minX, x);
+                c.maxX = Math.max(c.maxX, x);
+                c.minY = Math.min(c.minY, y);
+                c.maxY = Math.max(c.maxY, y);
+                merged = true;
+                break;
+              }
+            }
+            
+            if (!merged) {
+              rawClusters[team].push({ 
+                x: projected.x, 
+                z: projected.z, 
+                team, 
+                weight: 1,
+                minX: x, maxX: x, minY: y, maxY: y 
+              });
+            }
+          }
+        }
+      }
+
+      const applyNMS = (clusters: ClusterInternal[]) => {
+        const sorted = [...clusters].filter(c => c.weight >= minPixelWeight).sort((a, b) => b.weight - a.weight);
+        const kept: ClusterInternal[] = [];
+        for (const c of sorted) {
+          let overlap = false;
+          for (const k of kept) {
+            if (Math.hypot(k.x - c.x, k.z - c.z) < (clusteringRadius * 1.5)) {
+              overlap = true;
+              break;
+            }
+          }
+          if (!overlap) kept.push(c);
+        }
+        return kept.slice(0, 11);
+      };
+
+      const validDark = applyNMS(rawClusters.Dark);
+      const validLight = applyNMS(rawClusters.Light);
+
+      const players: Record<string, PlayerDetection> = {};
+      const debugBoxes: Array<{ minX: number; minY: number; maxX: number; maxY: number; team: string; weight: number }> = [];
+      let pCount = 1;
+
+      [...validDark, ...validLight].forEach(c => {
+        const id = `p_${pCount++}`;
+        players[id] = { 
+          id, x: Number(c.x.toFixed(2)), z: Number(c.z.toFixed(2)), team: c.team,
+          box: { minX: c.minX, minY: c.minY, maxX: c.maxX, maxY: c.maxY }
+        };
+        debugBoxes.push({ minX: c.minX, minY: c.minY, maxX: c.maxX, maxY: c.maxY, team: c.team, weight: c.weight });
+      });
+
+      setLiveFrameData({ players, ball: null, debugBoxes });
+    } catch (e) {
+      console.error("Vision Processing Error:", e);
+    }
+
+    animFrameRef.current = requestAnimationFrame(runVisionLoop);
+  }, [isPlaying, homographyMatrix, pitchCorners, k1Distortion, luminanceThreshold, clusteringRadius, minPixelWeight, motionSensitivity]);
+
+  useEffect(() => {
+    if (isPlaying) {
+      animFrameRef.current = requestAnimationFrame(runVisionLoop);
+    } else if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+    }
+    return () => {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    };
+  }, [isPlaying, runVisionLoop]);
+
   const handleVideoClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (homographyMatrix || !containerRef.current || !videoRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
     const x = Math.round((e.clientX - rect.left) * (videoRef.current.videoWidth / rect.width));
     const y = Math.round((e.clientY - rect.top) * (videoRef.current.videoHeight / rect.height));
     
-    if (!isDrawingMask) {
-      // Step 1: Collect up to 4 exact orientation corners
-      if (pitchCorners.length < 4) {
-        const newCorners = [...pitchCorners, { x, y }];
-        setPitchCorners(newCorners);
-        // Auto-fill mask with corners once 4 are reached
-        if (newCorners.length === 4) {
-          const sorted = sortFourCorners(newCorners);
-          if (sorted) setMaskPoints(sorted);
+    if (calibrationStep === 'corners') {
+      const newCorners = [...pitchCorners, { x, y }];
+      setPitchCorners(newCorners);
+      if (newCorners.length === 4) {
+        const sorted = sortFourCorners(newCorners);
+        if (sorted) {
+          setPitchCorners(sorted);
+          const undistortedSrcPoints = sorted.map(pt => 
+            undistortCoordinate(pt.x, pt.y, videoRef.current!.videoWidth, videoRef.current!.videoHeight, k1Distortion)
+          );
+          const dstPoints = [
+            { x: 0, y: 0 },    // Top-Left
+            { x: 105, y: 0 },  // Top-Right
+            { x: 105, y: 68 }, // Bottom-Right
+            { x: 0, y: 68 }    // Bottom-Left
+          ];
+          setHomographyMatrix(solveHomography(undistortedSrcPoints, dstPoints));
+          captureBackgroundFrame();
+          setCalibrationStep('ready');
+          setIsPlaying(true);
+          videoRef.current.play();
         }
       }
-    } else {
-      // Step 2: Custom Freeform Masking
-      setMaskPoints([...maskPoints, { x, y }]);
     }
-  };
-
-  const startLiveTracking = () => {
-    if (pitchCorners.length !== 4 || !videoRef.current) return;
-    
-    const sortedCorners = sortFourCorners(pitchCorners);
-    if (!sortedCorners) return;
-
-    // Fix matrix distortion based on lens setting
-    const undistortedSrcPoints = sortedCorners.map(pt => 
-      undistortCoordinate(pt.x, pt.y, videoRef.current!.videoWidth, videoRef.current!.videoHeight, k1Distortion)
-    );
-
-    // Hardcode 3D dimension mappings (X = 0..105, Z = 0..68)
-    const dstPoints = [
-      { x: 0, y: 0 },    // Top-Left (Far left)
-      { x: 105, y: 0 },  // Top-Right (Far right)
-      { x: 105, y: 68 }, // Bottom-Right (Near right)
-      { x: 0, y: 68 }    // Bottom-Left (Near left)
-    ];
-
-    setHomographyMatrix(solveHomography(undistortedSrcPoints, dstPoints));
-    setIsPlaying(true);
-    videoRef.current.play();
   };
 
   const getScale = () => {
@@ -398,7 +450,7 @@ export default function Home() {
       <div className="w-full border-b border-neutral-800 px-6 py-3 bg-neutral-900 flex justify-between items-center z-50">
         <div className="flex items-center gap-3">
           <div className={`w-2 h-2 ${isPlaying ? 'bg-emerald-500 animate-pulse' : 'bg-neutral-500'}`}></div>
-          <span className="text-xs font-bold tracking-widest text-white uppercase">TACTICAL RADAR V10.0 [DUAL CALIBRATION MATRIX]</span>
+          <span className="text-xs font-bold tracking-widest text-white uppercase">TACTICAL RADAR V14.0 [MOTION SUBTRACTION + CLEAN HOMOGRAPHY]</span>
         </div>
         <div className="flex items-center gap-4">
           <span className="text-[11px] text-neutral-400 font-semibold uppercase tracking-wider">SOURCE FEED:</span>
@@ -426,6 +478,14 @@ export default function Home() {
 
                 <div className="flex flex-col gap-2">
                   <div className="flex justify-between items-center">
+                    <span className="text-[10px] uppercase font-bold text-teal-400">Motion Sensitivity (Ignore Grass)</span>
+                    <span className="text-[10px] text-neutral-400">{motionSensitivity}</span>
+                  </div>
+                  <input type="range" min="10" max="80" step="1" value={motionSensitivity} onChange={(e) => setMotionSensitivity(parseInt(e.target.value))} className="w-full cursor-pointer accent-teal-500"/>
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  <div className="flex justify-between items-center">
                     <span className="text-[10px] uppercase font-bold text-amber-400">Kit Luminance Split</span>
                     <span className="text-[10px] text-neutral-400">{luminanceThreshold}</span>
                   </div>
@@ -447,67 +507,65 @@ export default function Home() {
                   </div>
                   <input type="range" min="1" max="25" step="1" value={minPixelWeight} onChange={(e) => setMinPixelWeight(parseInt(e.target.value))} className="w-full cursor-pointer accent-red-500"/>
                 </div>
+
+                <div className="flex items-center justify-between border-t border-neutral-800 pt-3">
+                  <span className="text-[10px] uppercase font-bold text-emerald-400">Show Tracker Bounding Boxes (Debug)</span>
+                  <input type="checkbox" checked={showDebugBoxes} onChange={(e) => setShowDebugBoxes(e.target.checked)} className="accent-emerald-500 w-4 h-4 cursor-pointer"/>
+                </div>
               </div>
 
-              {/* CALIBRATION INSTRUCTIONS */}
+              {/* CALIBRATION GUIDE */}
               <div className="flex flex-col gap-2 border border-neutral-800 p-3 bg-black rounded">
                 <div className="flex justify-between items-center">
-                  <span className={`text-[11px] font-bold tracking-wider uppercase ${pitchCorners.length < 4 ? 'text-amber-500' : 'text-emerald-500'}`}>
-                    {pitchCorners.length < 4 ? `STEP 1: SELECT 4 CORNERS (${pitchCorners.length}/4)` : 'ORIENTATION LOCKED'}
+                  <span className="text-[11px] font-bold tracking-wider uppercase text-amber-500">
+                    {calibrationStep === 'corners' && `CLICK 4 PITCH CORNERS IN ORDER (${pitchCorners.length}/4): TL -> TR -> BR -> BL`}
+                    {calibrationStep === 'ready' && 'STATUS: MATRIX LOCKED - LIVE MOTION TRACKING'}
                   </span>
-                  {(pitchCorners.length > 0 && !homographyMatrix) && (
-                    <button onClick={resetCalibration} className="text-[9px] text-neutral-400 hover:text-white underline">RESET</button>
-                  )}
+                  <button onClick={resetCalibration} className="text-[9px] text-neutral-400 hover:text-white underline">RESET</button>
                 </div>
-                
-                {pitchCorners.length === 4 && !homographyMatrix && (
-                  <div className="mt-2 flex items-center justify-between border-t border-neutral-800 pt-2">
-                     <span className="text-[10px] text-neutral-400">Mask bounds auto-generated.</span>
-                     <button onClick={() => { setMaskPoints([]); setIsDrawingMask(true); }} className={`text-[10px] px-2 py-1 border rounded transition ${isDrawingMask ? 'bg-cyan-900/50 border-cyan-500 text-cyan-300' : 'border-neutral-700 text-neutral-400 hover:border-cyan-500 hover:text-cyan-400'}`}>
-                       DRAW CUSTOM MASK
-                     </button>
-                  </div>
-                )}
               </div>
 
               <div ref={containerRef} onClick={handleVideoClick} style={{ aspectRatio: videoAspect }} className="relative border-2 border-neutral-800 bg-black cursor-crosshair w-full overflow-hidden shrink-0">
                 <video ref={videoRef} src={videoSrc} onLoadedMetadata={handleLoadedMetadata} className="w-full h-full object-fill opacity-90 pointer-events-none" muted playsInline />
                 
-                {/* 1. Draw Freeform Mask Polygon */}
-                {maskPoints.length > 0 && (
+                {/* Calibration Polygon Area */}
+                {pitchCorners.length > 0 && (
                   <svg className="absolute top-0 left-0 w-full h-full pointer-events-none z-10">
                     <polygon 
-                      points={maskPoints.map(p => `${p.x * scaleX},${p.y * scaleY}`).join(" ")} 
-                      fill="rgba(6, 182, 212, 0.1)" 
+                      points={pitchCorners.map(p => `${p.x * scaleX},${p.y * scaleY}`).join(" ")} 
+                      fill="rgba(6, 182, 212, 0.15)" 
                       stroke="#06b6d4" 
-                      strokeWidth="1.5" 
-                      strokeDasharray={isDrawingMask && maskPoints.length < 3 ? "5 5" : "0"} 
+                      strokeWidth="2" 
                     />
                   </svg>
                 )}
 
-                {/* 2. Draw Pitch Anchor Corners (Persistent) */}
+                {/* Pitch Corner Markers */}
                 {pitchCorners.map((pt, idx) => (
-                  <div 
-                    key={`anchor-${idx}`} 
-                    style={{ left: (pt.x * scaleX) - 6, top: (pt.y * scaleY) - 6 }} 
-                    className="absolute w-3 h-3 border-2 border-amber-500 bg-black/50 z-20 flex items-center justify-center rounded-sm"
-                  >
-                    <div className="w-1 h-1 bg-amber-500"></div>
+                  <div key={`corner-${idx}`} style={{ left: (pt.x * scaleX) - 6, top: (pt.y * scaleY) - 6 }} className="absolute w-3 h-3 border-2 border-amber-500 bg-black z-20 flex items-center justify-center rounded-sm">
+                    <span className="text-[8px] text-amber-400 font-bold absolute -top-3">{idx + 1}</span>
                   </div>
                 ))}
 
-                {/* 3. Draw Mask Nodes if actively drawing custom mask */}
-                {isDrawingMask && maskPoints.map((pt, idx) => (
-                  <div key={`mask-${idx}`} style={{ left: (pt.x * scaleX) - 4, top: (pt.y * scaleY) - 4 }} className="absolute w-2 h-2 bg-cyan-500 rounded-full z-30"></div>
-                ))}
+                {/* DEBUG BOUNDING BOXES OVERLAY */}
+                {showDebugBoxes && isPlaying && liveFrameData.debugBoxes.map((box, idx) => {
+                  const width = (box.maxX - box.minX) * scaleX;
+                  const height = (box.maxY - box.minY) * scaleY;
+                  const left = box.minX * scaleX;
+                  const top = box.minY * scaleY;
+                  const color = box.team === 'Dark' ? '#ef4444' : '#3b82f6';
+                  return (
+                    <div 
+                      key={`debug-box-${idx}`}
+                      style={{ left, top, width: Math.max(width, 12), height: Math.max(height, 12), borderColor: color }}
+                      className="absolute border border-dashed bg-white/10 z-30 pointer-events-none flex items-start p-0.5"
+                    >
+                      <span className="text-[8px] text-white bg-black/80 px-1 font-bold">{box.weight}px</span>
+                    </div>
+                  );
+                })}
               </div>
 
-              {pitchCorners.length === 4 && !homographyMatrix && (
-                <button onClick={startLiveTracking} className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-black font-black text-[11px] tracking-[0.2em] uppercase rounded-sm transition">
-                  INITIATE LIVE TRACKING
-                </button>
-              )}
             </div>
           ) : (
              <div className="h-full flex items-center justify-center border border-dashed border-neutral-800 text-[11px] text-neutral-500 uppercase tracking-widest">Awaiting Video File</div>
@@ -536,16 +594,7 @@ export default function Home() {
             <Canvas camera={{ position: [52.5, 55, 100], fov: 38 }}>
               <color attach="background" args={['#050505']} />
               <LiveSoccerPitch3D 
-                videoRef={videoRef} 
-                homographyMatrix={homographyMatrix} 
-                isPlaying={isPlaying} 
-                maskPoints={maskPoints} 
                 liveFrameData={liveFrameData} 
-                setLiveFrameData={setLiveFrameData} 
-                k1Distortion={k1Distortion} 
-                luminanceThreshold={luminanceThreshold} 
-                clusteringRadius={clusteringRadius} 
-                minPixelWeight={minPixelWeight} 
               />
               <OrbitControls target={[52.5, 0, 34]} maxPolarAngle={Math.PI / 2.15} enableDamping dampingFactor={0.05} />
             </Canvas>
